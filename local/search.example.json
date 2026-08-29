@@ -1,0 +1,25 @@
+{
+  "sites": ["indeed", "linkedin", "glassdoor"],
+  "hours_old": 96,
+  "country_indeed": "YOUR_COUNTRY",
+  "roles": ["YOUR_TARGET_ROLE"],
+  "locations": [
+    { "query": "YOUR_CITY_OR_REGION", "results": 25 }
+  ],
+  "location_aliases": {},
+  "priority": {
+    "weights": {
+      "geography": 0.35,
+      "role": 0.30,
+      "seniority": 0.25,
+      "freshness": 0.10
+    },
+    "role_patterns": [
+      { "pattern": "YOUR_TARGET_ROLE_PATTERN", "weight": 1.0 }
+    ],
+    "seniority_patterns": [],
+    "geography_patterns": [
+      { "pattern": "YOUR_LOCATION_PATTERN", "weight": 1.0 }
+    ]
+  }
+}
