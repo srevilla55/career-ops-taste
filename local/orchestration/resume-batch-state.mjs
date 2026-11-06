@@ -20,7 +20,8 @@
  *   node local/orchestration/resume-batch-state.mjs [--dry-run]
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, realpathSync, statSync } from 'fs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, statSync } from 'fs';
 import { spawnSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -47,6 +48,12 @@ export function finishedReports(files) {
   return out;
 }
 
+function reportScore(text) {
+  const match = /^\*\*Score:\*\*\s*([\d.]+)\s*\/\s*5/m.exec(text);
+  const score = match ? Number(match[1]) : NaN;
+  return Number.isFinite(score) && score >= 0 && score <= 5 ? String(score) : '-';
+}
+
 /**
  * Decide what each non-terminal row should become.
  *
@@ -62,6 +69,11 @@ export function planResume(rows, done) {
 }
 
 function main(argv) {
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/orchestration/resume-batch-state.mjs [options]');
+    return;
+  }
+
   const dry = argv.includes('--dry-run');
   if (!existsSync(STATE)) { console.log('no batch/batch-state.tsv — nothing to do'); return; }
 
@@ -93,7 +105,13 @@ function main(argv) {
   for (let i = 0; i < plan.length; i++) {
     const p = plan[i];
     if (p.next === p.status) continue;
-    if (p.rescued) { rescued++; console.log(`  ✓ #${p.id}: report ${p.report} already written — keeping as completed`); }
+    if (p.rescued) {
+      rescued++;
+      const file = readdirSync(REPORTS).find(f => f.startsWith(`${p.report}-`) && f.endsWith('.md') && !f.endsWith('-RESERVED.md'));
+      p.cols[6] = reportScore(readFileSync(path.join(REPORTS, file), 'utf-8'));
+      p.cols[7] = '-';
+      console.log(`  ✓ #${p.id}: report ${p.report} already written — keeping as completed (score ${p.cols[6]})`);
+    }
     else { reset++; }
     p.cols[2] = p.next;
     p.raw = p.cols.join('\t');
@@ -125,6 +143,10 @@ function main(argv) {
 }
 
 function demo() {
+  assert.equal(reportScore('**Score:** 3.8/5'), '3.8', 'rescue keeps the actual evaluation score');
+  assert.equal(reportScore('**Score:** 0/5'), '0');
+  assert.equal(reportScore('**Score:** 6/5'), '-');
+  assert.equal(reportScore('no score'), '-');
   assert.deepEqual(
     [...finishedReports(['001-acme-2026-01-01.md', '002-RESERVED.md', 'notes.txt'])],
     ['001'], 'sentinels and non-reports are not finished work');
@@ -149,10 +171,8 @@ function demo() {
   console.log('resume-batch-state self-check: all assertions passed');
 }
 
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

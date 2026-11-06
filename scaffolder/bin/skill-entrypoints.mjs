@@ -9,11 +9,11 @@ export const CANONICAL_SKILL_PATH = '.agents/skills/career-ops/SKILL.md';
 
 export const SKILL_ENTRYPOINTS = [
   {
-    path: '.claude/skills/career-ops/SKILL.md',
+    path: '.cursor/skills/career-ops/SKILL.md',
     pointer: '../../../.agents/skills/career-ops/SKILL.md',
   },
   {
-    path: '.cursor/skills/career-ops/SKILL.md',
+    path: '.claude/skills/career-ops/SKILL.md',
     pointer: '../../../.agents/skills/career-ops/SKILL.md',
   },
   {

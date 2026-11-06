@@ -19,11 +19,14 @@
  *   node local/orchestration/next-step.mjs [--brain claude|codex] [--json]
  */
 
-import { readFileSync, existsSync, readdirSync, realpathSync } from 'fs';
+import { walkTree } from '../../lib/walk-tree.mjs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import assert from 'assert';
-import yaml from 'js-yaml';
+import { loadYaml } from '../../lib/yaml-document.mjs';
+import { getProfilePath } from '../../path-resolver.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const p = f => path.join(ROOT, f);
@@ -86,8 +89,12 @@ export function nextAction({ pendingEval, due, missingJds, unscored }) {
   return 'DONE';
 }
 
-function load() {
-  const cfg = yaml.load(readFileSync(p('config/profile.yml'), 'utf-8')) || {};
+export function walkOutputFiles(dir) {
+  return walkTree(dir, { onError: 'throw' }).map(file => path.relative(dir, file));
+}
+
+function loadState() {
+  const cfg = loadYaml(readFileSync(getProfilePath(), 'utf-8')) || {};
   const packetBar = Number(cfg?.pipeline?.packet_min_score ?? 3.7);
   const packetMax = normalizePacketMax(cfg?.pipeline?.packet_max);
 
@@ -144,15 +151,7 @@ function load() {
 
   // A packet is finished when its outreach file exists — that is the last artifact written,
   // so its presence implies the CV and cover letter cleared their gates first.
-  const outputFiles = [];
-  const walk = (dir, prefix = '') => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const rel = path.join(prefix, entry.name);
-      if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
-      else if (entry.isFile()) outputFiles.push(rel);
-    }
-  };
-  if (existsSync(p('output'))) walk(p('output'));
+  const outputFiles = existsSync(p('output')) ? walkOutputFiles(p('output')) : [];
   const reportFiles = existsSync(p('reports')) ? readdirSync(p('reports')) : [];
   const slugFor = num => {
     const m = reportFiles.find(f => f.startsWith(num + '-') && !f.includes('RESERVED'));
@@ -178,7 +177,7 @@ function main(argv) {
   const arg = (flag, fallback) => { const i = argv.indexOf(flag); return i === -1 ? fallback : argv[i + 1]; };
   const brain = String(arg('--brain', process.env.CAREER_OPS_BRAIN || 'claude')).toLowerCase();
   if (!['claude', 'codex'].includes(brain)) throw new Error('--brain must be claude or codex');
-  const s = load();
+  const s = loadState();
   const packeted = s.evals.filter(s.hasPacket).length;
   const capacity = Number.isFinite(s.packetMax) ? Math.max(0, s.packetMax - packeted) : Infinity;
   const due = packetsDue(s.evals, s.packetBar, s.hasPacket, capacity);
@@ -187,7 +186,7 @@ function main(argv) {
   const action = nextAction({ pendingEval: s.pendingEval, due, missingJds: s.missingJds, unscored: s.unscored });
   let detail;
   if (action === 'PACKET') {
-    detail = `${due.length} evaluated role(s) at or above ${s.packetBar} with no packet (use ${brain === 'codex' ? 'gpt-5.6-sol' : 'the premium model'}): ` +
+    detail = `${due.length} evaluated role(s) at or above ${s.packetBar} with no packet (use ${brain === 'codex' ? 'gpt-6.1-sol at xhigh reasoning' : 'the premium model'}): ` +
       due.map(d => `${d.report}(${d.score})`).join(' ');
   } else if (action === 'EVAL') {
     detail = `${s.pendingEval} offer(s) queued — release a quarter (${Math.min(s.evalQuarter, s.pendingEval)}) with ${runner} --skip-pdf`;
@@ -238,7 +237,9 @@ function demo() {
   console.log('next-step self-check: all assertions passed');
 }
 
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv.includes('--demo')) demo();
+if (isMainModule(import.meta.url)) {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log('Usage: node local/orchestration/next-step.mjs [--brain claude|codex] [--json] [--demo]');
+  } else if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

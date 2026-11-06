@@ -1,10 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { rmSync } from './helpers.mjs';
 import { applicationArtifactPaths, ensureApplicationArtifactDirs, slugifySegment, writeReuseDecision } from '../application-artifacts.mjs';
-import { repoRelativeManifestPath } from '../generate-pdf.mjs';
+import { safeOutputPath } from '../generate-cover-letter.mjs';
+import { repoRelativeManifestPath, workspaceRelativeManifestPath } from '../generate-pdf.mjs';
+import { getCareerOpsRoot } from '../path-resolver.mjs';
 
 function expectError(label, action, pattern) {
   try {
@@ -24,8 +27,13 @@ try {
   const paths = applicationArtifactPaths({ reportNum: 7, company: 'Acme AI', role: 'Senior AI Engineer', version: 2, root });
   if (paths.key === '007-acme-ai-senior-ai-engineer'
       && paths.cv.source.html === join(paths.root, 'cv', 'source', 'original.html')
-      && paths.cv.tailored.pdf === join(paths.root, 'cv', 'tailored', 'v002', 'cv.pdf')) {
-    console.log('  ✅ application artifacts use a stable report/company/role bundle');
+      && paths.cv.tailored.html === join(paths.root, 'cv', 'tailored', 'v002', '007-cv.html')
+      && paths.cv.tailored.pdf === join(paths.root, 'cv', 'tailored', 'v002', '007-cv.pdf')
+      && paths.cover.markdown === join(paths.root, 'cover', '007-cover-letter.md')
+      && paths.cover.html === join(paths.root, 'cover', '007-cover-letter.html')
+      && paths.cover.pdf === join(paths.root, 'cover', '007-cover-letter.pdf')
+      && paths.outreach.email === join(paths.root, 'outreach', '007-recruiter-email.md')) {
+    console.log('  ✅ package leaves use the stable report number');
   } else {
     throw new Error(`unexpected artifact paths: ${JSON.stringify(paths)}`);
   }
@@ -34,6 +42,8 @@ try {
   if (existsSync(join(paths.root, 'jd'))
       && existsSync(join(paths.root, 'cv', 'source'))
       && existsSync(join(paths.root, 'cv', 'tailored', 'v002'))
+      && existsSync(join(paths.root, 'cover'))
+      && existsSync(join(paths.root, 'outreach'))
       && existsSync(join(paths.root, 'decision'))) {
     console.log('  ✅ application artifact directories initialize together');
   } else {
@@ -62,13 +72,30 @@ try {
   if (slugifySegment('!!!') === 'application') console.log('  ✅ punctuation-only slugs use the application fallback');
   else throw new Error('punctuation-only slug did not use the application fallback');
 
-  const repoPaths = applicationArtifactPaths({ reportNum: 7, company: 'Acme AI', role: 'Senior AI Engineer', version: 2, root: join(process.cwd(), 'output') });
-  if (repoRelativeManifestPath(repoPaths.cv.tailored.html) === 'output/007-acme-ai-senior-ai-engineer/cv/tailored/v002/cv.html'
-      && repoRelativeManifestPath(repoPaths.cv.tailored.pdf) === 'output/007-acme-ai-senior-ai-engineer/cv/tailored/v002/cv.pdf') {
+  // Manifest paths are relative to the workspace, which is the data root, not
+  // the working directory: the two differ whenever the data root is pointed
+  // elsewhere, as the suite points it (tests/helpers.mjs, #5113).
+  const repoPaths = applicationArtifactPaths({ reportNum: 7, company: 'Acme AI', role: 'Senior AI Engineer', version: 2, root: join(getCareerOpsRoot(), 'output') });
+  if (workspaceRelativeManifestPath(repoPaths.cv.tailored.html) === 'output/007-acme-ai-senior-ai-engineer/cv/tailored/v002/007-cv.html'
+      && workspaceRelativeManifestPath(repoPaths.cv.tailored.pdf) === 'output/007-acme-ai-senior-ai-engineer/cv/tailored/v002/007-cv.pdf'
+      && repoRelativeManifestPath(repoPaths.cv.tailored.pdf) === workspaceRelativeManifestPath(repoPaths.cv.tailored.pdf)) {
     console.log('  ✅ nested application HTML and PDF paths remain manifest-safe');
   } else {
     throw new Error('nested application paths were not preserved as repo-relative manifest entries');
   }
+
+  if (safeOutputPath('output/007-acme-ai-senior-ai-engineer/cover/007-cover-letter.pdf')
+      === join(getCareerOpsRoot(), 'output', '007-acme-ai-senior-ai-engineer', 'cover', '007-cover-letter.pdf')) {
+    console.log('  ✅ cover output preserves safe nested bundle paths');
+  } else {
+    throw new Error('safe nested cover output path was not preserved');
+  }
+  if (safeOutputPath('legacy-cover.pdf') === join(getCareerOpsRoot(), 'output', 'legacy-cover.pdf')) {
+    console.log('  ✅ flat one-off cover paths remain compatible');
+  } else {
+    throw new Error('flat cover output path compatibility changed');
+  }
+  expectError('cover output rejects traversal outside output', () => safeOutputPath('output/../escaped.pdf'), /outside output/);
 
   const cli = spawnSync(process.execPath, [
     fileURLToPath(new URL('../application-artifacts.mjs', import.meta.url)),

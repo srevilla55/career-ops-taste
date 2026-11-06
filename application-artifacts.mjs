@@ -11,9 +11,11 @@
 import { mkdirSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { parseArgs } from 'util';
-import { fileURLToPath } from 'url';
+import { validateFlags } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const DEFAULT_OUTPUT_ROOT = resolve('output');
+const DEFAULT_OUTPUT_ROOT = join(getCareerOpsRoot(), 'output');
 const DECISIONS = new Set(['reuse', 'reuse-with-edits', 'regenerate']);
 
 /** Convert a user-facing label into a safe, readable path segment. */
@@ -34,9 +36,12 @@ export function applicationArtifactPaths({ reportNum, company, role, version = 1
   if (!/^\d+$/.test(String(version ?? '')) || Number(version) < 1) {
     throw new Error('version must be a positive integer');
   }
-  const key = `${String(reportNum).padStart(3, '0')}-${slugifySegment(company)}-${slugifySegment(role, 'role')}`;
+  const report = String(reportNum).padStart(3, '0');
+  const key = `${report}-${slugifySegment(company)}-${slugifySegment(role, 'role')}`;
   const applicationRoot = join(resolve(root), key);
   const tailoredRoot = join(applicationRoot, 'cv', 'tailored', `v${String(version).padStart(3, '0')}`);
+  const coverRoot = join(applicationRoot, 'cover');
+  const outreachRoot = join(applicationRoot, 'outreach');
   return {
     key,
     root: applicationRoot,
@@ -51,10 +56,20 @@ export function applicationArtifactPaths({ reportNum, company, role, version = 1
       },
       tailored: {
         root: tailoredRoot,
-        html: join(tailoredRoot, 'cv.html'),
-        pdf: join(tailoredRoot, 'cv.pdf'),
+        html: join(tailoredRoot, `${report}-cv.html`),
+        pdf: join(tailoredRoot, `${report}-cv.pdf`),
         changes: join(tailoredRoot, 'changes.md'),
       },
+    },
+    cover: {
+      root: coverRoot,
+      markdown: join(coverRoot, `${report}-cover-letter.md`),
+      html: join(coverRoot, `${report}-cover-letter.html`),
+      pdf: join(coverRoot, `${report}-cover-letter.pdf`),
+    },
+    outreach: {
+      root: outreachRoot,
+      email: join(outreachRoot, `${report}-recruiter-email.md`),
     },
     decision: {
       reuse: join(applicationRoot, 'decision', 'reuse.json'),
@@ -68,6 +83,8 @@ export function ensureApplicationArtifactDirs(paths) {
     join(paths.root, 'jd'),
     join(paths.root, 'cv', 'source'),
     paths.cv.tailored.root,
+    paths.cover.root,
+    paths.outreach.root,
     join(paths.root, 'decision'),
   ]) mkdirSync(directory, { recursive: true });
   return paths;
@@ -101,11 +118,37 @@ export function writeReuseDecision(paths, {
   return record;
 }
 
-function usage() {
-  return 'Usage: node application-artifacts.mjs --report N --company NAME --role ROLE [--version N] [--root output] [--init]';
-}
+// --help was swallowed by parseArgs's strict mode and reported as an unknown
+// option (#2774), so the built-in help flag looked like a typo. Handled via
+// lib/cli-flags.mjs's validateFlags() (#2775), which rejects unrecognized
+// flags before --help so `--help --bogus` still errors.
+//
+// requireOperand is opted in because this script has no value validation of
+// its own to say anything better: without it `--report --help` consumed the
+// next token, printed usage and exited 0 (the #2961 class), so a malformed
+// flag went unreported.
+const KNOWN_FLAGS = ['--report', '--company', '--role', '--version', '--root', '--init', '--help', '-h'];
+
+// Every flag except --init takes its value as the next argv token.
+const VALUE_FLAGS = ['--report', '--company', '--role', '--version', '--root'];
+
+const USAGE = `Usage:
+  node application-artifacts.mjs --report N --company NAME --role ROLE [--version N] [--root DIR] [--init]
+
+Prints the resolved artifact paths for one application as JSON. The directory
+key is stable for a report/company/role tuple, so the JD, source CV, tailored
+CV, PDF and reuse decision stay together.
+
+  --report N       report number the bundle belongs to (required)
+  --company NAME   company name (required)
+  --role ROLE      role title (required)
+  --version N      tailored-CV version (default: 1)
+  --root DIR       output root (default: output)
+  --init           create the directories as well as printing the paths
+  --help, -h       show this message`;
 
 async function main() {
+  validateFlags(process.argv.slice(2), KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
   const { values } = parseArgs({
     options: {
       report: { type: 'string' },
@@ -118,7 +161,7 @@ async function main() {
     strict: true,
   });
   if (!values.report || !values.company || !values.role) {
-    console.error(usage());
+    console.error(USAGE);
     process.exitCode = 1;
     return;
   }
@@ -127,7 +170,7 @@ async function main() {
   console.log(JSON.stringify(paths, null, 2));
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     console.error(`application-artifacts: ${error.message}`);
     process.exitCode = 1;

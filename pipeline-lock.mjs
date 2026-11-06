@@ -8,38 +8,30 @@
 // silently drop one side's offers: whichever write lands second overwrites
 // the first's in-memory read, with no error and no trace anything was lost.
 //
-// Protocol — deliberately the same shape as the tracker lock in
-// tracker-utils.mjs, so there is one lock idiom in the codebase:
-//   - the lock is a directory ("<path>.lock"); a mkdir is atomic.
-//   - the holder records owner.json — pid, a unique token, started_at — so
-//     both stale-reclaim and release can verify who actually owns the lock
-//     before deleting anything.
-//   - staleness is judged by owner-PID liveness first, falling back to
-//     directory age only when the metadata is missing or unreadable. An old
-//     lock whose owner is still running is NOT stale, and an ownerless
-//     directory gets a fixed grace period (OWNERLESS_GRACE_MS) before age
-//     alone can condemn it, so a directory created microseconds ago is never
-//     reclaimable no matter how aggressive the caller's staleMs.
-//   - stale reclamation is serialized behind a second atomic guard directory
-//     ("<path>.lock.recover"). Without it, reclamation is itself a TOCTOU
-//     race: two callers that both judge the same lock stale can have the
-//     second one's rmSync delete the first one's freshly created lock, after
-//     which both believe they hold it — reintroducing the very race this
-//     module exists to close, just gated behind a crash + contention window.
-//
-// Timing is caller-configurable (with these defaults) so tests can exercise
-// contention in milliseconds instead of waiting out a multi-second constant.
+// The protocol itself — the lock directory, owner.json, the recover guard,
+// stale recovery and the token-checked release — is lib/dir-lock.mjs, shared
+// with every other lock in the core. This module picks the lock path, the
+// timing defaults and their env overrides, and the timeout error. The
+// protocol's helpers are re-exported so existing importers keep working.
 
-import { mkdirSync, rmSync, statSync, existsSync, writeFileSync, readFileSync } from 'fs';
-import { join, dirname } from 'path';
-import { randomUUID } from 'crypto';
+import { acquireDirLock, releaseOrWarn } from './lib/dir-lock.mjs';
+
+export {
+  OWNERLESS_GRACE_MS,
+  sameLockDirectory,
+  isMkdirContention,
+  isRmContention,
+  rmLockArtifactSync,
+  RECOVER_STALE,
+  RECOVER_VANISHED,
+  RECOVER_LIVE,
+  lockRecoveryVerdict,
+  createLockWaitPolicy,
+} from './lib/dir-lock.mjs';
 
 const DEFAULT_STALE_MS = 30_000;
-export const OWNERLESS_GRACE_MS = 1_000;
 const DEFAULT_RETRY_MS = 80;
 const DEFAULT_TIMEOUT_MS = 8_000;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class LockTimeoutError extends Error {
   constructor(lockDir, timeoutMs) {
@@ -53,64 +45,16 @@ export function lockDirFor(pipelinePath) {
   return `${pipelinePath}.lock`;
 }
 
-/** Owner metadata for a lock directory, or null when missing/unreadable. */
-function readLockOwner(lockDir) {
-  try {
-    return JSON.parse(readFileSync(join(lockDir, 'owner.json'), 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
-// Identity of a directory, so a lock that was removed and recreated by another
-// process is never mistaken for the one this caller created.
-function sameLockDirectory(left, right) {
-  return left.dev === right.dev && left.ino === right.ino
-    && (left.ino !== 0 || left.birthtimeMs === right.birthtimeMs);
-}
-
-function processIsAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === 'EPERM'; // exists, just not signalable by this user
-  }
-}
-
-// Conservative: a lock whose recorded owner is still running is never stale,
-// however old it is. Age is the fallback only when there's no readable owner.
-//
-// That fallback needs a floor. Two directories are ownerless by construction,
-// not by accident: a lock between its mkdir and its owner.json write, and the
-// recover guard, which never carries owner.json at all. Judging those on
-// `age > staleMs` alone lets a caller with an aggressive staleMs delete a
-// directory created microseconds ago — either stealing a winner's lock inside
-// its acquisition window, or evicting a live guard and putting two callers
-// inside the decide-then-delete window the guard exists to serialize.
-// OWNERLESS_GRACE_MS is a lower bound on that patience, never a cap: a larger
-// caller staleMs still wins, and a genuinely abandoned directory still ages
-// out, so a crash while holding the guard cannot disable recovery for good.
-function lockCanRecover(lockDir, staleMs) {
-  const owner = readLockOwner(lockDir);
-  if (owner?.pid) return !processIsAlive(owner.pid);
-  try {
-    return Date.now() - statSync(lockDir).mtimeMs > Math.max(staleMs, OWNERLESS_GRACE_MS);
-  } catch {
-    return true; // vanished — nothing to recover, retry acquisition
-  }
-}
-
 /**
  * Blocks until the lock on `pipelinePath` is held, then returns a handle whose
  * release() frees it. Throws LockTimeoutError if the lock stays busy.
  *
  * @param {string} pipelinePath - File the lock guards.
  * @param {object} [options]
- * @param {number} [options.timeoutMs=8000] - Max time to wait for the lock.
+ * @param {number} [options.timeoutMs=8000] - Max time a SINGLE holder may block this caller. Waiting is extended while the lock keeps changing hands (see createLockWaitPolicy).
  * @param {number} [options.retryMs=80] - Delay between acquisition attempts.
  * @param {number} [options.staleMs=30000] - Age threshold for a lock with no readable owner, floored at OWNERLESS_GRACE_MS.
+ * @param {number} [options.maxWaitMs] - Absolute ceiling on waiting, however much progress the lock makes. Defaults to 10x timeoutMs.
  */
 export async function acquirePipelineLock(pipelinePath, options = {}) {
   // Env overrides let a caller several frames up the stack (a test driving
@@ -119,101 +63,45 @@ export async function acquirePipelineLock(pipelinePath, options = {}) {
   const timeoutMs = options.timeoutMs ?? (Number(process.env.CAREER_OPS_PIPELINE_LOCK_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
   const retryMs = options.retryMs ?? (Number(process.env.CAREER_OPS_PIPELINE_LOCK_RETRY_MS) || DEFAULT_RETRY_MS);
   const staleMs = options.staleMs ?? (Number(process.env.CAREER_OPS_PIPELINE_LOCK_STALE_MS) || DEFAULT_STALE_MS);
-  const lockDir = lockDirFor(pipelinePath);
-  const recoverGuardDir = `${lockDir}.recover`;
-  const token = randomUUID();
-  const deadline = Date.now() + timeoutMs;
+  // A ceiling that is not a number is not a ceiling. NaN compares false against
+  // everything, so a bad value would not fail loudly — it would silently remove
+  // the only bound on waiting, which is the single thing this option exists to
+  // provide. Only a usable ceiling is honoured; everything else is dropped, and
+  // the protocol applies its default, which is at least bounded.
+  //
+  // Read WITHOUT the `|| default` idiom its three siblings above use, because
+  // for this one 0 is a meaningful setting — "never wait past now" — and
+  // `0 || default` would turn a caller who asked for no waiting into one who
+  // waits the whole default ceiling, the exact opposite. timeoutMs and retryMs
+  // have no such reading, which is why the idiom is fine there and wrong here.
+  //
+  // Infinity is kept as written: an explicit, legible "no ceiling" is a choice,
+  // not a mistake. -Infinity and NaN are mistakes, so they take the default
+  // rather than being clamped into a silently different behaviour.
+  const envMaxWait = process.env.CAREER_OPS_PIPELINE_LOCK_MAX_WAIT_MS;
+  const requestedMaxWait = options.maxWaitMs
+    ?? (envMaxWait === undefined || envMaxWait.trim() === '' ? undefined : envMaxWait);
+  const parsedMaxWait = requestedMaxWait === undefined ? undefined : Number(requestedMaxWait);
+  const maxWaitMs = parsedMaxWait === Infinity || (Number.isFinite(parsedMaxWait) && parsedMaxWait >= 0)
+    ? parsedMaxWait
+    : undefined;
 
-  // A fresh install may not have data/ yet — plugins.mjs's cmdRun calls
-  // appendToPipeline with no directory pre-creation, so create it here rather
-  // than letting mkdirSync(lockDir) throw a raw ENOENT.
-  mkdirSync(dirname(lockDir), { recursive: true });
-
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-    } catch (err) {
-      if (err?.code !== 'EEXIST') throw err;
-
-      // Serialize stale-reclaim behind a second atomic guard so only one
-      // caller can be inside the decide-then-delete window at a time.
-      let hasRecoverGuard = false;
-      try {
-        mkdirSync(recoverGuardDir);
-        hasRecoverGuard = true;
-      } catch (guardErr) {
-        if (guardErr?.code !== 'EEXIST') throw guardErr;
-        // A process killed between taking the guard and cleaning it up would
-        // otherwise disable stale recovery forever. The guard normally lives
-        // for milliseconds, so an old one is judged by the same age rule.
-        if (lockCanRecover(recoverGuardDir, staleMs)) {
-          rmSync(recoverGuardDir, { recursive: true, force: true });
-        }
-      }
-
-      if (hasRecoverGuard) {
-        try {
-          if (lockCanRecover(lockDir, staleMs)) {
-            rmSync(lockDir, { recursive: true, force: true });
-            continue; // retry acquisition immediately, still holding the guard's decision
-          }
-        } finally {
-          rmSync(recoverGuardDir, { recursive: true, force: true });
-        }
-      }
-
-      if (Date.now() > deadline) throw new LockTimeoutError(lockDir, timeoutMs);
-      await sleep(retryMs);
-      continue;
-    }
-
-    // Acquired. Record ownership; an owner-less lock would block every future
-    // acquirer until the age-out, so clean up if the stamp can't be written.
-    try {
-      writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({
-        pid: process.pid,
-        token,
-        started_at: new Date().toISOString(),
-        pipeline: pipelinePath,
-      }, null, 2));
-    } catch (ownerErr) {
-      rmSync(lockDir, { recursive: true, force: true });
-      throw ownerErr;
-    }
-
-    let released = false;
-    return {
-      lockDir,
-      release() {
-        if (released) return;
-        released = true;
-        // Verify this caller still owns the lock before removing anything: if
-        // our operation outlived staleMs and another process legitimately
-        // reclaimed the lock, deleting it here would free someone else's
-        // critical section.
-        let before;
-        try {
-          before = statSync(lockDir);
-        } catch {
-          return; // already gone
-        }
-        const owner = readLockOwner(lockDir);
-        if (owner?.token !== token) return; // reclaimed by someone else — leave it alone
-        let after;
-        try {
-          after = statSync(lockDir);
-        } catch {
-          return;
-        }
-        if (!sameLockDirectory(before, after)) return; // swapped underneath us
-        try {
-          rmSync(lockDir, { recursive: true, force: true });
-        } catch {
-          /* best-effort; a stale-reclaim will recover it */
-        }
-      },
-    };
-  }
+  const lock = await acquireDirLock(lockDirFor(pipelinePath), {
+    timeoutMs,
+    retryMs,
+    staleMs,
+    maxWaitMs,
+    owner: { pipeline: pipelinePath },
+    createParent: true,
+    timeoutError: ({ lockDir, expiredMs, owner, lastMkdirError, diagnosis }) => {
+      const err = new LockTimeoutError(lockDir, expiredMs);
+      err.owner = owner;
+      err.message += diagnosis;
+      if (lastMkdirError) err.lastMkdirError = lastMkdirError;
+      return err;
+    },
+  });
+  return { lockDir: lock.lockDir, release: lock.release };
 }
 
 /** Acquires the lock on `pipelinePath`, runs fn, and always releases it. */
@@ -222,6 +110,6 @@ export async function withPipelineLock(pipelinePath, fn, options = {}) {
   try {
     return await fn();
   } finally {
-    lock.release();
+    releaseOrWarn(lock);
   }
 }

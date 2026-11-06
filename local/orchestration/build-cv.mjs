@@ -23,7 +23,8 @@
  *         skills: [{category, items}], certifications: [{title, org}] }
  */
 
-import { readFileSync, writeFileSync, realpathSync } from 'fs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import assert from 'assert';
@@ -96,7 +97,7 @@ export function render(spec, tpl) {
     LANG: spec.lang || 'en', NAME: spec.name, EMAIL: spec.email, PHONE: spec.phone,
     LINKEDIN_URL: `https://${spec.linkedin}`, LINKEDIN_DISPLAY: spec.linkedin,
     PORTFOLIO_URL: `https://${spec.github}`, PORTFOLIO_DISPLAY: spec.github,
-    LOCATION: spec.location, PHOTO: '', PAGE_WIDTH: PRINTABLE_WIDTH,
+    LOCATION: spec.location, PHOTO: '', TITLE_BLOCK: '', CONSENT: '', PAGE_WIDTH: PRINTABLE_WIDTH,
     SECTION_SUMMARY: spec.labels?.summary || 'Summary', SUMMARY_TEXT: spec.summary,
     SECTION_COMPETENCIES: spec.labels?.competencies || 'Core Competencies',
     COMPETENCIES: (spec.competencies || []).map(c => `<div class="competency-tag">${esc(c)}</div>`).join(''),
@@ -105,6 +106,7 @@ export function render(spec, tpl) {
     SECTION_EDUCATION: spec.labels?.education || 'Education', EDUCATION: education,
     SECTION_CERTIFICATIONS: spec.labels?.certifications || 'Certifications', CERTIFICATIONS: certs,
     SECTION_AWARDS: '', AWARDS: '',
+    SECTION_INTERESTS: '', INTERESTS: '',
     SECTION_SKILLS: spec.labels?.skills || 'Technical Skills', SKILLS: skills,
   };
 
@@ -117,15 +119,16 @@ export function render(spec, tpl) {
   if (!projects) out = dropSection(out, 'PROJECTS');
   if (!vals.COMPETENCIES) out = dropSection(out, 'CORE COMPETENCIES');
   if (!experience) out = dropSection(out, 'WORK EXPERIENCE');
+  out = dropSection(out, 'INTERESTS');
   return out;
 }
 
 function demo() {
   const tpl = readFileSync(path.join(ROOT, 'templates/cv-template.html'), 'utf-8');
   const html = render({
-    name: 'A B', email: 'a@b.c', phone: '1', linkedin: 'l/x', github: 'g/x', location: 'Example City',
+    name: 'A B', email: 'a@b.c', phone: '1', linkedin: 'l/x', github: 'g/x', location: 'Madrid',
     summary: 'S', competencies: ['One'],
-    experience: [{ company: 'Acme', location: 'Example City', period: '2024', role: 'Role', bullets: ['<strong>Did</strong> a thing'] }],
+    experience: [{ company: 'Acme', location: 'Madrid', period: '2024', role: 'Dev', bullets: ['<strong>Did</strong> a thing'] }],
     education: [{ title: 'BSc', org: 'UPM', year: '2026' }],
     skills: [{ category: 'Cloud', items: 'Docker' }],
   }, tpl);
@@ -148,11 +151,11 @@ function demo() {
   console.log('build-cv self-check: all assertions passed');
 }
 
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv.includes('--demo')) demo();
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log('Usage: node local/orchestration/build-cv.mjs spec.json out.html | --demo');
+  } else if (process.argv.includes('--demo')) demo();
   else {
     const [specPath, outPath] = process.argv.slice(2);
     const tpl = readFileSync(path.join(ROOT, 'templates/cv-template.html'), 'utf-8');

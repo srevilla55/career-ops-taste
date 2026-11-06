@@ -17,16 +17,12 @@ export const PROFILE_CADENCE_KEYS = [
 ] as const;
 export type ProfileCadenceKey = (typeof PROFILE_CADENCE_KEYS)[number];
 
-/** Kept IDENTICAL to DEFAULT_CADENCE in followup-cadence.mjs (the source of
- *  truth) — only used to show the settings form's baseline values. */
-export const CADENCE_DEFAULTS: Record<ProfileCadenceKey, number> = {
-  applied_first_days: 7,
-  applied_subsequent_days: 7,
-  applied_max_followups: 2,
-  responded_initial_days: 1,
-  responded_subsequent_days: 3,
-  interview_thankyou_days: 1,
-};
+/* CADENCE_DEFAULTS used to live here as a hand-copy of DEFAULT_CADENCE in
+   followup-cadence.mjs, kept in sync by a comment. It is gone (#2369): the
+   pure defaults now come from the core itself via `followup-cadence.mjs
+   --json` -> `cadenceDefaults`, read server-side in /api/followups/cadence.
+   Do not reintroduce a local table here, not even as a fallback — a fallback
+   copy drifts exactly like the original did (states.ts FALLBACK, #2282). */
 
 /** One logged follow-up (a row of data/follow-ups.md; legacy bullets have num null). */
 export type FollowupLogEntry = {
@@ -49,7 +45,7 @@ export type CadenceEntry = {
   appliedDate: string;
   company: string;
   role: string;
-  status: "applied" | "responded" | "interview";
+  status: "applied" | "responded" | "assessment" | "interview";
   score: string;
   notes: string;
   reportPath: string | null;
@@ -92,11 +88,11 @@ export function urgencyTone(u: string): "bad" | "warn" | "info" | "muted" {
   return "muted";
 }
 
-/** Status badge tone per spec: interview=green, responded=blue, else neutral. */
+/** Status badge tone per spec: interview=green, responded/assessment=blue, else neutral. */
 export function followupStatusTone(status: string): "good" | "info" | "muted" {
   const s = status.toLowerCase();
   if (s.includes("interview")) return "good";
-  if (s.includes("responded")) return "info";
+  if (s.includes("responded") || s.includes("assessment")) return "info";
   return "muted";
 }
 
@@ -111,8 +107,8 @@ export function relativeDays(daysUntil: number): string {
 /** 7/14-day escalation for "days since" cells: amber bold ≥7, red bold ≥14. */
 export function daysHeatClass(days: number | null): string {
   if (days == null) return "text-faint";
-  if (days >= 14) return "font-bold text-red-600 dark:text-red-400";
-  if (days >= 7) return "font-bold text-amber-600 dark:text-amber-400";
+  if (days >= 14) return "font-bold text-red-700 dark:text-red-400";
+  if (days >= 7) return "font-bold text-amber-800 dark:text-amber-400";
   return "";
 }
 

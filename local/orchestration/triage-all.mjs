@@ -20,14 +20,16 @@
  *   node local/orchestration/triage-all.mjs [--brain claude|codex] [--chunk N] [--limit N] [--model NAME] [--demo]
  */
 
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'fs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'fs';
 import { execFile, execFileSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import assert from 'assert';
-import yaml from 'js-yaml';
+import { loadYaml } from '../../lib/yaml-document.mjs';
+import { getProfilePath } from '../../path-resolver.mjs';
 
 import { priorityScore } from '../ingest-jobspy.mjs';
 import { parseRow } from './hydrate-jds.mjs';
@@ -97,15 +99,15 @@ export function parseVerdicts(stdout) {
 
 function loadThreshold() {
   try {
-    const cfg = yaml.load(readFileSync(path.join(ROOT, 'config/profile.yml'), 'utf-8')) || {};
+    const cfg = loadYaml(readFileSync(getProfilePath(), 'utf-8')) || {};
     return Number(cfg?.pipeline?.triage_threshold) || 3.5;
   } catch { return 3.5; }
 }
 
 function loadModel(brain) {
-  if (brain === 'codex') return 'gpt-5.6-terra';
+  if (brain === 'codex') return 'gpt-6.1-sol';
   try {
-    const cfg = yaml.load(readFileSync(path.join(ROOT, 'config/profile.yml'), 'utf-8')) || {};
+    const cfg = loadYaml(readFileSync(getProfilePath(), 'utf-8')) || {};
     return { economy: 'claude-haiku-4-5', premium: 'claude-opus-5' }[cfg?.spend_tier] || 'claude-sonnet-5';
   } catch { return 'claude-sonnet-5'; }
 }
@@ -337,7 +339,7 @@ async function runChunk(chunk, model, systemPrompt, brain, chunkIndex) {
   }
 
   return runWorker('claude',
-    ['-p', '--model', model, '--strict-mcp-config', '--dangerously-skip-permissions', '--safe-mode',
+    ['-p', '--model', model, '--strict-mcp-config', '--permission-mode', 'dontAsk', '--safe-mode',
       // Keeps the ~38k chunk prefix byte-identical across chunks: cwd/env/git-status
       // move into the user message, so a verdict written between chunks no longer
       // invalidates it. Valid with --append-system-prompt-file (ignored only with
@@ -348,7 +350,7 @@ async function runChunk(chunk, model, systemPrompt, brain, chunkIndex) {
       // exception being a block marked "no JD on file", which needs WebFetch.
       // Handing over exactly that one tool enforces the contract structurally and
       // drops the whole default roster: prefix 19,485 -> 8,145 tokens per request.
-      '--tools', 'WebFetch',
+      '--tools', 'WebFetch', '--allowedTools', 'WebFetch',
       '--append-system-prompt-file', systemPrompt],
     safe,
   );
@@ -501,9 +503,9 @@ async function main(argv) {
 }
 
 function demo() {
-  assert.equal(loadModel('codex'), 'gpt-5.6-terra', 'Codex triage uses Terra');
+  assert.equal(loadModel('codex'), 'gpt-6.1-sol', 'Codex triage uses GPT-6.1 Sol');
   const out = `Here you go:
-#1 TRIAGE: PASS | Acme Corp | Example Role | 4.3/5 | location and archetype match, comp clears floor
+#1 TRIAGE: PASS | Acme Corp | Backend Engineer | 4.3/5 | Madrid, archetype hit, comp clears floor
 #2 TRIAGE: FAIL | Globex | Staff Engineer | 2.0/5 | Hard DQ: 5+ yrs required
   #3 TRIAGE: MARGINAL | Initech | Full Stack Dev | 3.4/5 | mostly frontend, comp unstated
 #4 TRIAGE: SKIP | Umbrella | Unknown | 0/5 | Posting inaccessible`;
@@ -512,7 +514,7 @@ function demo() {
   assert.deepEqual(v.map(x => x.verdict), ['PASS', 'FAIL', 'MARGINAL', 'SKIP']);
   assert.equal(v[0].score, 4.3);
   assert.equal(v[0].company, 'Acme Corp');
-  assert.equal(v[0].reason, 'location and archetype match, comp clears floor');
+  assert.equal(v[0].reason, 'Madrid, archetype hit, comp clears floor');
   assert.equal(v[2].n, 3, 'leading whitespace does not break the index');
   assert.equal(v[3].score, 0);
 
@@ -571,10 +573,8 @@ function demo() {
   console.log('triage-all self-check: all assertions passed');
 }
 
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

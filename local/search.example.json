@@ -1,5 +1,5 @@
 {
-  "sites": ["indeed", "linkedin", "glassdoor"],
+  "sites": ["indeed", "linkedin"],
   "hours_old": 96,
   "country_indeed": "YOUR_COUNTRY",
   "roles": ["YOUR_TARGET_ROLE"],

@@ -11,20 +11,16 @@ LIMIT="${1:-25}"
 
 node - "$LIMIT" <<'EOF'
 import { readFileSync, existsSync } from 'fs';
-import { priorityScore, loadPriorityConfig } from './local/ingest-jobspy.mjs';
+import { priorityScore } from './local/ingest-jobspy.mjs';
 import { locationHintFromUrl } from './scan.mjs';
-
-let priority;
-try { priority = loadPriorityConfig(undefined, { required: true }); }
-catch (err) { console.error(`today: ${err.message}`); process.exit(1); }
 
 // Workday reports a multi-city posting as "8 Locations" and puts only the
 // PRIMARY city in the URL path (/job/Milano/...). 40% of some boards look like
 // this, and a bare "3 Locations" scores the 0.2 geo fallback — which is how a
-// a target-city role ends up at the bottom of the queue.
+// Madrid rol de prácticas ends up at the bottom of the queue.
 //
 // Partial fix on purpose: the URL names one city, not all of them, so a role
-// that spans two cities still ranks as the URL's city. Recovering the full list
+// that spans Milano AND Madrid still ranks as Milano. Recovering the full list
 // needs a per-job detail fetch, which is not worth it for sort order. Strictly
 // better than 0.2 either way.
 const MULTI_LOCATION = /^\d+\s+locations?$/i;
@@ -62,11 +58,7 @@ for (const line of pending.split('\n')) {
     // those are most of the queue — so compute it here for anything unscored.
     // Same pure function either way, so the whole queue sorts on one scale.
     prio: prio >= 0 ? prio
-      : priorityScore(
-        { title, location: rankableLocation(location, url), postedAt: posted ? Date.parse(posted) : undefined },
-        Date.now(),
-        priority,
-      ),
+      : priorityScore({ title, location: rankableLocation(location, url), postedAt: posted ? Date.parse(posted) : undefined }),
   });
 }
 

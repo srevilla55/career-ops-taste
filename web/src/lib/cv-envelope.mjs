@@ -60,7 +60,7 @@ const CLOSER_ALL = new RegExp(CLOSER_SRC, "gm");
  * capabilities invites it to test the claim.
  */
 export const CV_ENVELOPE_INSTRUCTION =
-  `Do NOT save or edit any file — the platform persists your output for you. Instead OUTPUT the finished HTML inline, between two marker lines. The first line contains only the opening marker carrying your chosen page format — \`${OPEN_MARK} format="a4">>\` or \`${OPEN_MARK} format="letter">>\`, and nothing else on that line. Choose letter for a US/Canada company, otherwise a4. Then the complete HTML document, then a final line containing only \`${CLOSE_MARK}\`. Each marker appears exactly once. Emit the WHOLE document from <!DOCTYPE html> to </html> — never abbreviate, summarize, or write "unchanged"; the platform renders exactly these bytes and nothing else.`;
+  `Do NOT save or edit any file — the platform persists your output for you. Instead OUTPUT the finished HTML inline, between two marker lines. The first line contains only the opening marker carrying the required A4 page format — \`${OPEN_MARK} format="a4">>\`, and nothing else on that line. Every employer-facing CV in this checkout must be exactly one A4 page, per modes/_custom.md. Then the complete HTML document, then a final line containing only \`${CLOSE_MARK}\`. Each marker appears exactly once. Emit the WHOLE document from <!DOCTYPE html> to </html> — never abbreviate, summarize, or write "unchanged"; the platform renders exactly these bytes and nothing else.`;
 
 /**
  * @typedef {Object} CvEnvelope

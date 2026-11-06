@@ -2,34 +2,62 @@
 
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { resolve, join } from 'path';
+import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { getCareerOpsRoot } from './path-resolver.mjs';
+import { resolveCliLaunch } from './lib/agent-launch.mjs';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const batchStateFile = join(__dirname, 'batch', 'batch-state.tsv');
-const reportsDir = join(__dirname, 'reports');
+// CAREER_OPS_BATCH_STATE overrides the batch-state.tsv path — the same override
+// merge-tracker.mjs already honours, so tests can drive this script against a
+// sandbox instead of the developer's real batch run.
+const batchStateFile = process.env.CAREER_OPS_BATCH_STATE
+  ? resolve(process.env.CAREER_OPS_BATCH_STATE)
+  : join(__dirname, 'batch', 'batch-state.tsv');
+// reports/ is User Layer (DATA_CONTRACT.md), so it follows the data root —
+// CAREER_OPS_ROOT / CAREER_OPS_DATA_DIR / .career-ops-data — not the code
+// checkout. batch/ and modes/ are System Layer and stay on __dirname.
+const reportsDir = join(getCareerOpsRoot(), 'reports');
 
-function usage() {
-  console.log(`career-ops batch tailor — bulk generate tailored CVs for high-scoring batch jobs
+const USAGE = `career-ops batch tailor — bulk generate tailored CVs for high-scoring batch jobs
 
 Usage:
-  node batch-tailor.mjs [--min-score=4.0]
+  node batch-tailor.mjs [--min-score N]
 
 Options:
-  --min-score=N   Minimum score to tailor (default: 4.0)
-`);
-  process.exit(0);
-}
+  --min-score N   Minimum score to tailor (default: 4.0). The --min-score=N form works too.
+  --help, -h      Show this help
+`;
 
 const args = process.argv.slice(2);
-if (args.includes('-h') || args.includes('--help')) {
-  usage();
-}
+
+// Route through the shared parser instead of hand-rolling it: this script used
+// to read only the `--min-score=N` form, so `--min-score 4.5` was dropped and a
+// typo fell through — both silently ran at the 4.0 default and spawned worker
+// runs the caller never asked for. That is the #2459 class lib/cli-flags.mjs
+// exists to end.
+// requireOperand: `--min-score --help` would otherwise print usage and exit 0,
+// so the malformed flag is never reported and the numeric check below never
+// runs. This script has nothing more specific to say about a missing operand
+// than the shared message, which is exactly when opting in is right.
+validateFlags(args, ['--min-score', '--help', '-h'], USAGE, { valueFlags: ['--min-score'], requireOperand: true });
 
 let minScore = 4.0;
-for (const arg of args) {
-  if (arg.startsWith('--min-score=')) {
-    minScore = parseFloat(arg.split('=')[1]);
+if (hasFlag(args, '--min-score')) {
+  const raw = flagValue(args, '--min-score');
+  // Number(), not parseFloat(): parseFloat stops at the first invalid character,
+  // so "4.5abc" silently became 4.5 and the run proceeded on a threshold the
+  // caller never wrote. The empty/whitespace guard must come FIRST — Number('')
+  // is 0, which is finite, and a 0 threshold tailors every completed job.
+  const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  minScore = trimmed === '' ? NaN : Number(trimmed);
+  // A NaN threshold compares false against every score, so the old code printed
+  // "no roles found with score >= NaN" and exited 0 — indistinguishable from a
+  // genuinely empty batch. Fail loudly instead.
+  if (!Number.isFinite(minScore)) {
+    console.error(`ERROR: --min-score expects a number, got ${raw === undefined ? '(no value)' : `"${raw}"`}`);
+    process.exit(1);
   }
 }
 
@@ -38,7 +66,19 @@ if (!existsSync(batchStateFile)) {
   process.exit(1);
 }
 
-const lines = readFileSync(batchStateFile, 'utf-8').split('\n');
+// existsSync() is true for a directory and says nothing about permissions, so
+// reading can still throw (EISDIR, EACCES) — an uncaught stack trace where a
+// usage error belongs. Name the RESOLVED path: with CAREER_OPS_BATCH_STATE set,
+// the value that failed is not the one written in the source.
+let stateContent;
+try {
+  stateContent = readFileSync(batchStateFile, 'utf-8');
+} catch (err) {
+  console.error(`ERROR: cannot read batch state file at ${batchStateFile}: ${err.message}`);
+  process.exit(1);
+}
+
+const lines = stateContent.split('\n');
 const toProcess = [];
 
 for (const line of lines) {
@@ -75,7 +115,12 @@ for (let i = 0; i < toProcess.length; i++) {
   
   // Try to find the local report file to pass to the agent
   const matchingReport = reports.find(f => f.startsWith(`${job.reportNum}-`) && f.endsWith('.md'));
-  const reportContext = matchingReport ? `\nThe evaluation report is available at: reports/${matchingReport}` : '';
+  // Absolute, for the same reason as modes/pdf.md below: with a split data
+  // root, a bare `reports/...` points the worker at the code checkout, where
+  // the report does not exist.
+  const reportPath = matchingReport ? join(reportsDir, matchingReport) : null;
+  if (reportPath) console.log(`  Report: ${reportPath}`);
+  const reportContext = reportPath ? `\nThe evaluation report is available at: ${reportPath}` : '';
   
   const prompt = `Tailor the CV for this role and generate the HTML and PDF CVs. \nURL: ${job.url}\nReport number: ${job.reportNum}${reportContext}`;
   
@@ -83,18 +128,33 @@ for (let i = 0; i < toProcess.length; i++) {
     '-p',
     '--dangerously-skip-permissions',
     '--append-system-prompt-file',
-    'modes/pdf.md',
+    // Absolute: the state file already resolves through __dirname, so passing
+    // this one bare handed the worker a cwd-relative path that only exists when
+    // the script happens to run from the project root. modes/pdf.md is where
+    // the CV fact gate (verify-cv-facts.mjs, step 19) is instructed, so losing
+    // it silently drops the anti-fabrication check from a bulk CV run.
+    join(__dirname, 'modes', 'pdf.md'),
     prompt
   ];
   
-  const res = spawnSync('claude', claudeArgs, { stdio: 'inherit' });
+  // On Windows an npm-installed claude is only a .cmd shim, which spawnSync
+  // cannot run without a shell (lib/agent-launch.mjs). Elsewhere this is 'claude'.
+  let res;
+  try {
+    const launch = resolveCliLaunch('claude', claudeArgs);
+    res = spawnSync(launch.command, launch.args, { stdio: 'inherit' });
+  } catch (err) {
+    res = { status: null, error: err };
+  }
   if (res.error) {
     console.error(`Error running claude: ${res.error.message}`);
+    process.exitCode = 1;
   } else if (res.status !== 0) {
     console.error(`Worker exited with status ${res.status}`);
+    process.exitCode = 1;
   } else {
     console.log(`✅ Finished tailoring for Report ${job.reportNum}`);
   }
 }
 
-console.log('\nBulk tailoring complete.');
+console.log(process.exitCode ? '\nBulk tailoring completed with worker failures.' : '\nBulk tailoring complete.');

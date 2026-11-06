@@ -26,9 +26,30 @@ var (
 	reMoneySpan = buildMoneySpanRegex(currencyTokens)
 	// ISO dates embedded in notes ("Rejected 2026-06-04", "viewed 2026-06-04")
 	reISODate = regexp.MustCompile(`\b20\d{2}-\d{2}-\d{2}\b`)
+
+	// "posted 2026-08-07" / "Posted: 2026-08-07" — when the requisition went
+	// live, as written into the tracker notes. Distinct from the "(POSTED)"
+	// pay-source marker, which carries no date.
+	//
+	// Anchored to the start of a line or a note segment, NOT to a word boundary.
+	// The date this matches is subtracted from the last-contact scan below, so
+	// an over-broad match does not merely mislabel a date — it deletes a real
+	// interaction. With `\bposted`, the note "Recruiter posted 2026-07-20 update
+	// on the req" on a row dated 2026-06-01 moved LastContact from 2026-07-20
+	// back to 2026-06-01: a recruiter contact that happened, silently gone.
+	// Segment-anchored, that same prose is left alone and only a deliberate
+	// `posted: <date>` segment is read as posting metadata.
+	//
+	// Capture 1 is the anchor itself so the stripping below can put it back;
+	// capture 2 is the date. The colon form accepts no space after it
+	// ("posted:2026-07-15"), the bare form requires one, so "posted2026-07-15"
+	// is not a date segment.
+	rePostedOn = regexp.MustCompile(`(?im)(^|[;|])[^\S\n]*posted(?::[^\S\n]*|[^\S\n]+)(20\d{2}-\d{2}-\d{2})\b`)
 	// "City ST" / "City, ST" with a strict two-letter US state code so prose like
 	// "Sams AI" or "Kerin Colby DONE" can't false-positive.
 	reCityState = regexp.MustCompile(`\b([A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,2}),? (A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|N[CDEHJMVY]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])\b`)
+	// Explicit "Location: <value>" in notes; the value ends at ";" or a newline.
+	reLocationLabel = regexp.MustCompile(`(?i)\blocation:\s*([^;\n]+)`)
 	// International cities, checked only when no US "City, ST" matches, so
 	// European/other non-US roles still surface a Location. Cities only (not bare
 	// country names) to avoid prose false-positives like "Portugal eligible" or
@@ -77,10 +98,16 @@ func buildMoneySpanRegex(currencies []string) *regexp.Regexp {
 			suffixParts = append(suffixParts, q)
 		}
 	}
+	// Left boundary guard (RE2 has no lookbehind) on the amount-first branch
+	// only: stops "G18 EUR" / "IC4 EUR" level codes from being read as tiny
+	// money spans that shadow the real amount later in the string (#4600).
+	// A currency-first span is anchored by its token, so it still matches
+	// right after a letter ("US$120K", "年収¥8M"). Real span: group 1
+	// (currency first) or group 2 (amount first).
 	pattern := fmt.Sprintf(
-		`~?(?:(?:%s)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?`+
-			`(?:\s*[-–]\s*(?:%s)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?`+
-			`|\d[\d,]*(?:\.\d+)?[KkMmBb]?`+
+		`(~?(?:%s)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?`+
+			`(?:\s*[-–]\s*(?:%s)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)`+
+			`|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?`+
 			`(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?`+
 			`\s+(?:%s))`,
 		strings.Join(prefixParts, "|"),
@@ -129,20 +156,39 @@ func payCeiling(span string) float64 {
 // deriveNoteFields populates Location, WorkMode, PayRange, PaySource and
 // LastContact from the application's Notes (plus Role for work-mode keywords).
 func deriveNoteFields(app *model.CareerApplication) {
-	lower := strings.ToLower(app.Role + " " + app.Notes)
+	lower := strings.ToLower(app.Role + " " + app.Notes + " " + app.Location)
 
-	// Location: first "City, ST" in the notes, falling back to the role title
-	// (some tracker rows carry the city there, e.g. "... — Charlotte, NC"). When
-	// no US "City, ST" is present, fall back to an international city/country so
-	// European and other non-US roles still show a Location.
-	if m := reCityState.FindStringSubmatch(app.Notes); m != nil {
-		app.Location = m[1] + ", " + m[2]
-	} else if m := reCityState.FindStringSubmatch(app.Role); m != nil {
-		app.Location = m[1] + ", " + m[2]
-	} else if m := reCityIntl.FindString(app.Notes); m != "" {
-		app.Location = m
-	} else if m := reCityIntl.FindString(app.Role); m != "" {
-		app.Location = m
+	// Location: an explicit value (tracker Location column, already set by the
+	// reader, then a "Location: ..." segment in the notes ending at ";" or a
+	// newline) is kept whatever the town. Otherwise infer the first "City, ST" in
+	// the notes, falling back to the role title (some tracker rows carry the city
+	// there, e.g. "... — Charlotte, NC"). When no US "City, ST" is present, fall
+	// back to an international city/country so European and other non-US roles
+	// still show a Location.
+	if app.Location == "" {
+		if m := reLocationLabel.FindStringSubmatch(app.Notes); m != nil {
+			app.Location = CanonicalizeLocation(m[1])
+		}
+	}
+	if app.Location == "" {
+		if m := reCityState.FindStringSubmatch(app.Notes); m != nil {
+			app.Location = CanonicalizeLocation(m[1] + ", " + m[2])
+		}
+	}
+	if app.Location == "" {
+		if m := reCityState.FindStringSubmatch(app.Role); m != nil {
+			app.Location = CanonicalizeLocation(m[1] + ", " + m[2])
+		}
+	}
+	if app.Location == "" {
+		if m := reCityIntl.FindString(app.Notes); m != "" {
+			app.Location = CanonicalizeLocation(m)
+		}
+	}
+	if app.Location == "" {
+		if m := reCityIntl.FindString(app.Role); m != "" {
+			app.Location = CanonicalizeLocation(m)
+		}
 	}
 
 	// Work mode: hybrid beats remote ("Remote/hybrid" means office days exist);
@@ -168,12 +214,17 @@ func deriveNoteFields(app *model.CareerApplication) {
 	// (e.g. "$170K min floor") only when no range exists. Skip money spans
 	// that are actually funding/valuation figures ("$600M valuation", "$70M
 	// Series C") — they describe the company, not compensation.
+	// Submatch group 1 or 2: the real span, without reMoneySpan's boundary guard.
 	var matches []string
-	for _, idx := range reMoneySpan.FindAllStringIndex(app.Notes, -1) {
-		if reFundingContext.MatchString(app.Notes[idx[1]:]) {
+	for _, m := range reMoneySpan.FindAllStringSubmatchIndex(app.Notes, -1) {
+		start, end := m[2], m[3]
+		if start < 0 {
+			start, end = m[4], m[5]
+		}
+		if reFundingContext.MatchString(app.Notes[end:]) {
 			continue
 		}
-		matches = append(matches, app.Notes[idx[0]:idx[1]])
+		matches = append(matches, app.Notes[start:end])
 	}
 	for _, mm := range matches {
 		if strings.ContainsAny(mm, "-–") {
@@ -194,10 +245,29 @@ func deriveNoteFields(app *model.CareerApplication) {
 		}
 	}
 
+	// Posting date: when the requisition went live. Drives the POSTED column,
+	// which answers "is this req still plausibly being worked?" — a role posted
+	// yesterday is a very different bet from one that has sat open for months.
+	// Two posting segments in one note is a re-post, not a contradiction: the
+	// column answers "how long has this been open", so the latest one is the
+	// live requisition and the earlier one is history. Taking the first match
+	// would pin the row to a req that has already been replaced.
+	for _, m := range rePostedOn.FindAllStringSubmatch(app.Notes, -1) {
+		if m[2] > app.PostedOn {
+			app.PostedOn = m[2]
+		}
+	}
+
 	// Last contact: the most recent ISO date mentioned anywhere in the notes
 	// (rejections, recruiter views, phone screens), else the applied date.
+	// The posting date is stripped first — when the req went live is not an
+	// interaction with the company, and letting it through would show a
+	// freshly-posted role as if it had just been touched.
+	// "$1" keeps the anchor (the line start or the `;`/`|` separator) so removing
+	// a segment cannot weld its neighbours into one.
+	contactNotes := rePostedOn.ReplaceAllString(app.Notes, "$1")
 	last := app.Date
-	for _, d := range reISODate.FindAllString(app.Notes, -1) {
+	for _, d := range reISODate.FindAllString(contactNotes, -1) {
 		if d > last {
 			last = d
 		}

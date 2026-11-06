@@ -1,0 +1,4 @@
+interface:
+  display_name: "Career Ops Evaluation"
+  short_description: "Run or resume evaluation-only job batches"
+  default_prompt: "Use $career-ops-evaluation to run or resume the approved evaluation batch without PDFs or application materials."

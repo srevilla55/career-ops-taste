@@ -23,12 +23,13 @@
  *   node local/apply-descriptions.mjs --file desc.json [--dry-run]
  */
 
+import { isMainModule } from '../lib/is-main-module.mjs';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { sanitizeMarkdownField } from '../scan.mjs';
-import { jdLanguage, priorityScore, loadPriorityConfig } from './ingest-jobspy.mjs';
+import { jdLanguage, priorityScore } from './ingest-jobspy.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PIPELINE = path.join(ROOT, 'data', 'pipeline.md');
@@ -101,7 +102,7 @@ export function locationSlot(line) {
  *
  * prio is recomputed rather than patched because geography carries 35% of the
  * weight: a row that scored 0.60 with no location is a different row once it
- * turns out to contain a configured target location.
+ * turns out to say Madrid.
  */
 export function rewriteRowLocation(line, location, priority) {
   const { fields, index, hasCell } = locationSlot(line);
@@ -112,19 +113,19 @@ export function rewriteRowLocation(line, location, priority) {
   const title = fields[2] || '';
   const postedField = fields.find(f => f.startsWith('posted:')) || '';
   const posted = Date.parse(postedField.replace('posted:', '').trim());
-  const prio = priorityScore(
-    { title, location: clean, postedAt: Number.isFinite(posted) ? posted : undefined },
-    Date.now(),
-    priority,
-  );
+  const prio = priorityScore({
+    title, location: clean, postedAt: Number.isFinite(posted) ? posted : undefined,
+  }, Date.now(), priority);
 
   return fields.join(' | ').replace(/\bprio [0-9.]+/, `prio ${prio.toFixed(2)}`);
 }
 
 function main(argv) {
-  let priority;
-  try { priority = loadPriorityConfig(undefined, { required: true }); }
-  catch (err) { console.error(`apply-descriptions: ${err.message}`); process.exit(1); }
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/apply-descriptions.mjs [options]');
+    return;
+  }
+
   const dryRun = argv.includes('--dry-run');
   const fileIdx = argv.indexOf('--file');
   const raw = fileIdx !== -1 ? readFileSync(argv[fileIdx + 1], 'utf-8') : readFileSync(0, 'utf-8');
@@ -179,7 +180,7 @@ function main(argv) {
 
     if (location) {
       updated = rewriteJdLocation(updated, location);
-      newRow = rewriteRowLocation(newRow, location, priority);
+      newRow = rewriteRowLocation(newRow, location);
     }
 
     if (updated === existing && newRow === hit.line) { stats.unchanged++; continue; }
@@ -208,6 +209,6 @@ function main(argv) {
   );
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   main(process.argv.slice(2));
 }

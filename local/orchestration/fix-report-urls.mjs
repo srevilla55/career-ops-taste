@@ -13,7 +13,8 @@
  *   node local/orchestration/fix-report-urls.mjs [--dry-run] [--demo]
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, realpathSync } from 'fs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import assert from 'assert';
@@ -21,11 +22,8 @@ import assert from 'assert';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const REPORTS = path.join(ROOT, 'reports');
 
-/** The posting URL a JD file was built from, or null when it records none. */
-export function originalUrlFrom(jdText) {
-  const m = jdText.match(/^-\s+\*\*Original URL:\*\*\s*(\S+)\s*$/m);
-  return m ? m[1] : null;
-}
+import { originalUrlFrom } from '../../jd-capture.mjs';
+export { originalUrlFrom } from '../../jd-capture.mjs';
 
 /** Rewrite a report's `**URL:**` header when it points at a local JD path. */
 export function rewriteHeader(report, realUrl) {
@@ -33,6 +31,11 @@ export function rewriteHeader(report, realUrl) {
 }
 
 function main(argv) {
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/orchestration/fix-report-urls.mjs [options]');
+    return;
+  }
+
   const dryRun = argv.includes('--dry-run');
   let fixed = 0, skipped = 0;
 
@@ -63,6 +66,8 @@ function demo() {
   ].join('\n');
   assert.equal(originalUrlFrom(jd), 'https://www.linkedin.com/jobs/view/4453941065');
   assert.equal(originalUrlFrom('# Role\n\n- **Company:** Acme\n'), null, 'absent stays null, never guessed');
+  assert.equal(originalUrlFrom('**URL:** https://example.invalid/job/1'), 'https://example.invalid/job/1');
+  assert.equal(originalUrlFrom('original_url: "https://example.invalid/job/2"'), 'https://example.invalid/job/2');
 
   const report = ['# Evaluation: Acme — Backend', '', '**Score:** 4.0/5',
     '**URL:** local:jds/jobspy/acme-backend-abc.md', '**PDF:** not generated'].join('\n');
@@ -77,10 +82,8 @@ function demo() {
   console.log('fix-report-urls self-check: all assertions passed');
 }
 
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

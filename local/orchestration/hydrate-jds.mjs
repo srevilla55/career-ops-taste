@@ -22,7 +22,8 @@
  *   node local/orchestration/hydrate-jds.mjs [--concurrency N] [--unscored-only] [--dry-run] [--demo]
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'fs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -77,6 +78,19 @@ export function parseRow(line) {
 /** A `local:` token already points at its JD file; anything else has to be fetched. */
 export function indexPathFor(token) {
   return token.startsWith('local:') ? token.slice('local:'.length) : null;
+}
+
+// Retain uncertainty outside this run; replace outcomes only for selected tokens.
+function mergeUncertainRows(previous, selectedTokens, uncertain) {
+  const selected = new Set(selectedTokens);
+  const rows = new Map(previous.split(/\r?\n/).filter(Boolean)
+    .map(line => [line.split('\t')[0], line]).filter(([token]) => !selected.has(token)));
+  for (const row of uncertain) {
+    const cells = [row.token, row.company, row.title, row.why]
+      .map(value => String(value ?? '').replace(/[\t\r\n]+/g, ' '));
+    rows.set(row.token, cells.join('\t'));
+  }
+  return rows.size ? [...rows.values()].join('\n') + '\n' : '';
 }
 
 async function extract(url) {
@@ -157,6 +171,11 @@ async function pooled(items, limit, worker) {
 }
 
 async function main(argv) {
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/orchestration/hydrate-jds.mjs [options]');
+    return;
+  }
+
   const arg = (flag, dflt) => {
     const i = argv.indexOf(flag);
     return i === -1 ? dflt : argv[i + 1];
@@ -311,19 +330,23 @@ async function main(argv) {
     });
   }
 
+  const uncertainFile = path.join(ROOT, 'data/jd-uncertain.tsv');
+  if (uncertain.length || existsSync(uncertainFile)) {
+    const previous = existsSync(uncertainFile) ? readFileSync(uncertainFile, 'utf-8') : '';
+    const merged = mergeUncertainRows(previous, rows.map(row => row.token), uncertain);
+    if (merged !== previous) writeFileSync(uncertainFile, merged, 'utf-8');
+  }
   if (uncertain.length) {
-    writeFileSync(path.join(ROOT, 'data/jd-uncertain.tsv'),
-      uncertain.map(r => `${r.token}\t${r.company}\t${r.title}\t${r.why}`).join('\n') + '\n', 'utf-8');
     console.log(`${uncertain.length} posting(s) left pending as uncertain → data/jd-uncertain.tsv (live, but unreadable headlessly)`);
   }
   console.log(`\nhydrated ${live} (${cached} reused from a previous run) · uncertain ${uncertain.length} · expired ${expired.length} · index ${index.size} entries → data/jd-index.tsv`);
 }
 
 function demo() {
-  const row = parseRow('- [ ] https://x.com/j/1 | Acme | Example Role | Example City | posted: 2026-08-14 | note: prio 0.9 src:linkedin url:https://real/1');
+  const row = parseRow('- [ ] https://x.com/j/1 | Acme | Backend Engineer | Madrid, Spain | posted: 2026-08-14 | note: prio 0.9 src:linkedin url:https://real/1');
   assert.equal(row.token, 'https://x.com/j/1');
   assert.equal(row.company, 'Acme');
-  assert.equal(row.location, 'Example City');
+  assert.equal(row.location, 'Madrid, Spain');
   assert.equal(row.posted, '2026-08-14');
   assert.equal(row.url, 'https://real/1', 'note url: wins over slot 0');
 
@@ -339,15 +362,22 @@ function demo() {
   assert.equal(indexPathFor('local:jds/jobspy/a.md'), 'jds/jobspy/a.md');
   assert.equal(indexPathFor('https://x.com/j/1'), null);
 
+  const prior = 'old\tAcme\tDev\tTLS unresolved\n';
+  const unreadable = { token: 'new', company: 'Other', title: 'Dev', why: 'login\nwall' };
+  assert.equal(mergeUncertainRows(prior, ['new'], [unreadable]),
+    prior + 'new\tOther\tDev\tlogin wall\n', 'a scoped hydration retains earlier uncertainty');
+  assert.equal(mergeUncertainRows(prior, ['new'], []), prior, 'a successful scoped hydration retains untouched uncertainty');
+  assert.equal(mergeUncertainRows(prior, ['old'], []), '', 'an explicitly retried resolved token leaves uncertainty');
+  assert.equal(mergeUncertainRows(prior, ['old'], [{ ...unreadable, token: 'old' }]),
+    'old\tOther\tDev\tlogin wall\n', 'a retried uncertain token is updated once');
+
   console.log('hydrate-jds self-check: all assertions passed');
 }
 
 // Entry check first: triage-all.mjs imports parseRow from here, and a bare argv check
 // would fire this module's demo during that import.
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

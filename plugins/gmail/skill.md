@@ -24,8 +24,16 @@ plugins:
   gmail: { enabled: true, label: "Job Leads", days_back: 7 }
 ```
 
+For LinkedIn alerts, use `label: "LinkedIn Jobs"`, `linkedin_alerts: true`, and
+`daily_verified: false` directly under `plugins.gmail` (no nested `settings`).
+Follow [the local OAuth setup and preview guide](../../docs/LINKEDIN_JOBS.md).
+Only set `daily_verified: true` after a verified manual preview/import. Keep
+credentials in the ignored `.env`, never in YAML or chat.
+
 ## Data it produces
 
 `Job[]` ({ title, url, company, location }) — the engine de-dups against the
 pipeline and appends new ones. It maintains its own processed-message cursor in
-`data/gmail-state.json` to avoid re-reading the same emails.
+`data/gmail-state.json`, under your data root, to avoid re-reading the same
+emails. The host commits that cursor only after the pipeline and history writes
+succeed; preview leaves it unchanged.

@@ -23,10 +23,12 @@
  *   node local/ingest-jobspy.mjs --dry-run
  */
 
+import { localToday } from '../lib/local-today.mjs';
+import { isMainModule } from '../lib/is-main-module.mjs';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import * as yaml from 'js-yaml';
+import { loadYaml } from '../lib/yaml-document.mjs';
 
 import {
   loadSeenUrls,
@@ -266,7 +268,7 @@ function isAggregator(url) {
  * mirror of it, because that is the one we would rather apply through.
  * Then geography, then whichever body we can actually read.
  */
-function betterCopy(a, b, priority) {
+function betterCopy(a, b, priority = ACTIVE_PRIORITY) {
   return (isAggregator(b.url) - isAggregator(a.url))
     || (weightFor(priority.geography, a.location || '', 0) - weightFor(priority.geography, b.location || '', 0))
     || ((a.description?.length || 0) - (b.description?.length || 0));
@@ -281,11 +283,12 @@ function betterCopy(a, b, priority) {
  *      with the richer description.
  *   2. Same company and title under DIFFERENT urls, in two flavours:
  *
- *      a) One board fanning one opening out across cities under distinct ids.
- *      b) Two boards mirroring the same employer posting.
+ *      a) One board fanning one opening out across several cities and job IDs.
+ *      b) Multiple aggregators mirroring the same employer posting.
  *
  *      betterCopy() decides the winner: the employer's own board over any
- *      aggregator's mirror, then configured geography, then readable body.
+ *      aggregator's mirror of it, then geography (the same 35% weight
+ *      priorityScore uses), then whichever body we can actually read.
  *
  * Returns three lists:
  *   unique     — the winners
@@ -361,24 +364,23 @@ ${offer.description || '_No description captured. Fetch the original URL during 
 function loadPortals() {
   const p = path.join(ROOT, 'portals.yml');
   if (!existsSync(p)) return {};
-  return yaml.load(readFileSync(p, 'utf-8')) || {};
+  return loadYaml(readFileSync(p, 'utf-8')) || {};
 }
 
 export function buildFilters(config) {
   return {
     title: buildTitleFilter(config.title_filter),
     location: buildLocationFilter(config.location_filter),
-    age: buildPostingAgeFilter(config.max_posting_age_days),
+    age: buildPostingAgeFilter(process.env.SCAN_MAX_POSTING_AGE_DAYS ?? config.max_posting_age_days),
   };
 }
 
 async function main(argv) {
-  let priority;
-  try { priority = loadPriorityConfig(undefined, { required: true }); }
-  catch (err) {
-    console.error(`ingest-jobspy: ${err.message}`);
-    process.exit(1);
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/ingest-jobspy.mjs [options]');
+    return;
   }
+
   const dryRun = argv.includes('--dry-run');
   const fileIdx = argv.indexOf('--file');
   const raw = fileIdx !== -1
@@ -428,7 +430,7 @@ async function main(argv) {
     normalized.push(o);
   }
 
-  const { unique, collapsed, urlDupes } = dedupeBatch(normalized, priority);
+  const { unique, collapsed, urlDupes } = dedupeBatch(normalized);
   stats.batchDupes = normalized.length - unique.length;
   for (const o of [...collapsed, ...urlDupes]) bump(o.site, 'dupe');
 
@@ -450,7 +452,7 @@ async function main(argv) {
 
   // Highest priority first, so the top of ## Pending is the best of the run.
   const now = Date.now();
-  for (const o of kept) o.prio = priorityScore(o, now, priority);
+  for (const o of kept) o.prio = priorityScore(o, now);
   kept.sort((a, b) => b.prio - a.prio);
 
   const offers = [];
@@ -480,7 +482,7 @@ async function main(argv) {
       console.log(`${o.prio.toFixed(2)}  ${o.site.padEnd(10)} ${o.company} — ${o.title} — ${o.location}`);
     }
   } else if (offers.length) {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localToday();
     // Pipeline row: local JD ref. History row: the REAL url — that is the
     // durable dedup key shared with scan.mjs, so the same posting found later
     // on Greenhouse is recognized as already seen.
@@ -507,6 +509,6 @@ async function main(argv) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainModule(import.meta.url)) {
   await main(process.argv.slice(2));
 }

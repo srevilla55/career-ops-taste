@@ -21,14 +21,12 @@
  * would still let a cold parallel burst through. With both, the 29 above
  * becomes 1.
  *
- * Why patch `dns.lookup` rather than configure the HTTP client: career-ops
- * depends on no HTTP library — providers call the global `fetch()`. Node
- * exposes no supported way to give `fetch()` a custom resolver without
- * taking on `undici` as a direct dependency to build an `Agent` with a
- * `connect.lookup` option. Patching the `node:dns` module object keeps the
- * dependency list untouched: `net.connect` reads `dns.lookup` at call time,
- * so importing this file once (`_http.mjs` does) covers every provider and
- * every direct `fetch()` in the process.
+ * Why patch `dns.lookup` rather than configure each HTTP client: providers
+ * normally call the global `fetch()`. `net.connect` reads `dns.lookup` at call
+ * time, so importing this file once (`_http.mjs` does) covers direct requests
+ * without changing their dispatcher. Proxy opt-in uses an undici dispatcher
+ * only for provider requests; direct and NO_PROXY requests still need this
+ * cache and address guard.
  *
  * Scope of the patch — deliberately narrow:
  *   - Only the callback-style `dns.lookup` on the `node:dns` module object.
@@ -50,6 +48,7 @@
  */
 
 import dns from 'node:dns';
+import { inProviderFetch, isTrustedProxyLookup, isBlockedAddress, blockedAddressError } from './_ip-guard.mjs';
 
 /**
  * DNS failures that mean *the resolver itself refused or failed*, as opposed
@@ -244,11 +243,40 @@ export function createCachedLookup(realLookup, options = {}) {
   /** @type {Map<string, Function[]>} */
   const inflight = new Map();
 
+  /**
+   * Wrap a lookup callback so a non-public address never reaches the connector
+   * (#3096).
+   *
+   * Applied at ENTRY, so it covers all three ways a result is delivered: a
+   * fresh resolver answer, a cache HIT, and a coalesced waiter. Validating
+   * only the resolver path would leave the cache as the hole — a hostname
+   * resolved outside a provider fetch is cached unvalidated, and the next
+   * provider fetch for that name would be served the private address from
+   * memory without ever reaching the check.
+   *
+   * Only inside a provider request: this lookup is patched process-wide, and
+   * loopback has to keep working for everything else (see _ip-guard.mjs).
+   */
+  function guarded(hostname, callback) {
+    if (!inProviderFetch()) return callback;
+    return (err, ...rest) => {
+      if (err) return callback(err, ...rest);
+      // all:true yields one array of {address, family}; otherwise (address, family).
+      const addresses = Array.isArray(rest[0])
+        ? rest[0].map((entry) => entry && entry.address)
+        : [rest[0]];
+      const bad = addresses.find((address) => isBlockedAddress(address));
+      if (bad !== undefined && !isTrustedProxyLookup(hostname)) return callback(blockedAddressError(hostname, bad, addresses));
+      return callback(err, ...rest);
+    };
+  }
+
   function cachedLookup(hostname, options, callback) {
     if (typeof options === 'function') {
       callback = options;
       options = {};
     }
+    callback = guarded(hostname, callback);
     // dns.lookup accepts a bare family number in place of an options object.
     const opts = typeof options === 'number' ? { family: options } : (options ?? {});
     const key = `${hostname}|${opts.family ?? 0}|${opts.all ? 1 : 0}|${opts.hints ?? 0}|${opts.verbatim ?? ''}`;

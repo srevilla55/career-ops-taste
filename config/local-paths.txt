@@ -1,0 +1,8 @@
+# Shared fork-owned source, maintained through this repository.
+# Relative source paths only; this is not candidate configuration.
+TASTE.md
+scripts/check-publication.mjs
+validate-batch-artifacts.mjs
+batch/codex-runner.sh
+local/
+test/cv-visual/

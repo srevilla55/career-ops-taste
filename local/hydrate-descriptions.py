@@ -2,12 +2,11 @@
 """Repair postings captured without JD text or without a location.
 
 Needed because dedup is durable: once a URL is in data/scan-history.tsv, a
-re-scan correctly refuses to re-add it. The 205 LinkedIn description stubs from
-the first run, and the 53 rows jobspy stripped the location off (see
-jobspy_patches.py, bug A), can only be repaired by fetching them directly.
+re-scan correctly refuses to re-add it. Description stubs and missing locations
+can only be repaired by fetching them directly.
 
-Not a one-shot. Any future run where LinkedIn rate-limits mid-way leaves stubs
-behind, and this repairs those too.
+LinkedIn repairs reuse captured text only. Missing text needs the employer
+posting or pasted JD; the guest detail endpoint is never retried.
 
 Reads job URLs on stdin (one per line), writes [{job_url, description,
 location}] to stdout — either field may be absent. Per-URL try/except, so one
@@ -23,27 +22,18 @@ import random
 import re
 import sys
 import time
-
-from bs4 import BeautifulSoup
-
-import jobspy_patches
 from jobspy.glassdoor import Glassdoor
-from jobspy.linkedin import LinkedIn
+from jobspy.glassdoor.constant import domains, headers
+import linkedin_requests
+from jobspy_fetch import load_search_config
 from jobspy.model import Country, DescriptionFormat, ScraperInput
-from jobspy.util import markdown_converter, remove_attributes
+from jobspy.util import TLSRotating, create_session
 
-jobspy_patches.apply()
-
-LINKEDIN_ID = re.compile(r"/jobs/view/(\d+)")
+LINKEDIN_ID = re.compile(r"^https://(?:[\w-]+\.)?linkedin\.com/(?:comm/)?jobs/view/(?:[^/?#]*-)?(\d+)(?:[/?#]|$)", re.I)
 GLASSDOOR_ID = re.compile(r"[?&]jl=(\d+)")
 
-# The job page carries the location the search card sometimes omits. Two class
-# names because LinkedIn serves both layouts; the first that hits wins.
-LOCATION_CLASSES = ("topcard__flavor--bullet", "sub-nav-cta__meta-text")
-
-
 def _scraper_input():
-    return ScraperInput(site_type=[], search_term="",
+    return ScraperInput(search_term="", country_indeed=Country(load_search_config()["country_indeed"].lower()),
                         description_format=DescriptionFormat.MARKDOWN)
 
 
@@ -51,59 +41,34 @@ class Fetchers:
     """Lazily built so we only pay for the sites actually present in the input."""
 
     def __init__(self):
-        self._linkedin = None
         self._glassdoor = None
+        self.transport_failures = 0
+        self.jd_unavailable = 0
 
-    @property
-    def linkedin(self):
-        if self._linkedin is None:
-            self._linkedin = LinkedIn()
-            self._linkedin.scraper_input = _scraper_input()
-        return self._linkedin
+    def observe_transport(self, session):
+        request = session.request
+        def observed(*args, **kwargs):
+            try:
+                response = request(*args, **kwargs)
+            except Exception:
+                self.transport_failures += 1
+                raise
+            if response.status_code != 200:
+                self.transport_failures += 1
+            return response
+        session.request = observed
+        return session
 
     @property
     def glassdoor(self):
         if self._glassdoor is None:
             gd = Glassdoor()
             gd.scraper_input = _scraper_input()
-            gd.base_url = Country.SPAIN.get_glassdoor_url()
-            # scrape() normally builds the session and the csrf header; do it here.
-            from jobspy.glassdoor.constant import fallback_token, headers
-            from jobspy.util import create_session
-            gd.session = create_session(has_retry=True)
-            hdrs = dict(headers)
-            hdrs["gd-csrf-token"] = fallback_token
-            gd.session.headers.update(hdrs)
+            gd.base_url = f"https://{domains[gd.scraper_input.country_indeed]}"
+            gd.session = self.observe_transport(create_session(TLSRotating(gd.scraper_input.proxies),
+                                                gd.scraper_input, headers))
             self._glassdoor = gd
         return self._glassdoor
-
-
-def _linkedin_page(scraper, job_id):
-    """One GET, both fields. Upstream's _get_job_details drops the location, and
-    fetching the same page twice to get it back would be silly."""
-    res = scraper.session.get(f"{scraper.base_url}/jobs/view/{job_id}", timeout=10)
-    res.raise_for_status()
-    if "linkedin.com/signup" in res.url:
-        return {}
-
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    description = None
-    body = soup.find("div", class_=lambda c: c and "show-more-less-html__markup" in c)
-    if body is not None:
-        description = markdown_converter(
-            remove_attributes(body).prettify(formatter="html"))
-
-    location = None
-    for cls in LOCATION_CLASSES:
-        tag = soup.find(class_=lambda c, want=cls: c and want in c)
-        text = tag.get_text(strip=True) if tag else ""
-        # The bullet spans also carry applicant counts ("27 applicants").
-        if text and not text[0].isdigit():
-            location = " ".join(text.split())
-            break
-
-    return {"description": description, "location": location}
 
 
 def fetch_one(url, fetchers):
@@ -111,11 +76,17 @@ def fetch_one(url, fetchers):
     try:
         m = LINKEDIN_ID.search(url)
         if m:
-            return _linkedin_page(fetchers.linkedin, m.group(1))
+            cached = dict(linkedin_requests.DETAILS.get(str(m.group(1)), {}))
+            if not cached.get("description"):
+                fetchers.jd_unavailable += 1
+                print(f"  - {url}: JD unavailable; provide the employer posting or pasted text", file=sys.stderr)
+            return cached
         m = GLASSDOOR_ID.search(url)
         if m:
             # Glassdoor rows always arrive with a location; only the body is at risk.
-            return {"description": fetchers.glassdoor._fetch_job_description(int(m.group(1)))}
+            job_id = f"gd-{m.group(1)}"
+            details = fetchers.glassdoor._fetch_details([job_id]).get(job_id, {})
+            return {"description": details.get("description")}
     except Exception as exc:  # noqa: BLE001 — a dead posting is not a run failure
         print(f"  ! {url}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return {}
@@ -129,7 +100,13 @@ def main():
                     help="base seconds between requests (jittered), default 0.4")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--linkedin-request-budget", type=int, default=32,
+                    help="legacy request cap; LinkedIn JD repair is cache-only")
     args = ap.parse_args()
+    if args.delay < 0 or args.limit is not None and args.limit < 1 or args.linkedin_request_budget < 1:
+        ap.error("--delay must be nonnegative; --limit and --linkedin-request-budget must be positive")
+    linkedin_requests.REQUEST_LIMIT = linkedin_requests.REQUEST_ATTEMPTS + args.linkedin_request_budget
+    linkedin_requests.load_saved_details()
 
     urls = [ln.strip() for ln in sys.stdin if ln.strip()]
     seen = set()
@@ -139,7 +116,12 @@ def main():
 
     fetchers = Fetchers()
     out, descs, locs = [], 0, 0
+    budget_exhausted = False
     for i, url in enumerate(urls, 1):
+        if LINKEDIN_ID.search(url) and linkedin_requests.REQUEST_ATTEMPTS >= linkedin_requests.REQUEST_LIMIT:
+            budget_exhausted = True
+            print("hydrate: LinkedIn request budget exhausted; preserving completed repairs", file=sys.stderr)
+            break
         got = fetch_one(url, fetchers) or {}
         row = {"job_url": url}
         if got.get("description"):
@@ -150,6 +132,10 @@ def main():
             locs += 1
         if len(row) > 1:
             out.append(row)
+        if linkedin_requests.RATE_LIMITED:
+            print("hydrate: preserving completed repairs; stopped after LinkedIn 429",
+                  file=sys.stderr)
+            break
         if not args.quiet and (i % 25 == 0 or i == len(urls)):
             print(f"  · {i}/{len(urls)} fetched, {descs} with text, {locs} with location",
                   file=sys.stderr)
@@ -159,7 +145,8 @@ def main():
     print(f"hydrate: {len(urls)} URLs → {descs} descriptions, {locs} locations",
           file=sys.stderr)
     json.dump(out, sys.stdout)
-    sys.exit(0 if out else 1)
+    sys.exit(2 if linkedin_requests.RATE_LIMITED or budget_exhausted or fetchers.transport_failures or fetchers.jd_unavailable
+             else 0 if out else 1)
 
 
 if __name__ == "__main__":

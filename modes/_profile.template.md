@@ -1,52 +1,39 @@
 # Candidate profile context
 
-<!-- USER LAYER: doctor copies this to modes/_profile.md on first run. The
-     onboarding agent must replace every placeholder from the candidate's own
-     evidence. Do not assume an industry, occupation, seniority, or location. -->
+<!-- Private user copy is created during onboarding. Never infer candidate facts. -->
 
-## Target roles
+## Your Target Roles
 
-| Archetype | Relevant strengths | What an employer buys |
-|-----------|--------------------|-----------------------|
-| **{target role}** | {skills supported by the CV} | {specific value} |
-| **{adjacent role}** | {transferable skills} | {specific value} |
+| Archetype | Thematic axes | What they buy |
+|---|---|---|
+| {candidate-confirmed target role} | {CV-supported strengths} | {specific value} |
 
-## Adaptive framing
+## Your Adaptive Framing
 
-| If the role is... | Emphasize... | Evidence source |
-|-------------------|--------------|-----------------|
-| {target role} | {relevant experience} | {CV section or confirmed answer} |
-| {adjacent role} | {transferable experience} | {CV section or confirmed answer} |
+| If the role is... | Emphasize about you... | Proof point sources |
+|---|---|---|
+| {target role} | {relevant confirmed experience} | {CV section or confirmed statement} |
 
-## Career narrative
+## Your Exit Narrative
 
-{Write a truthful two-to-four sentence bridge from the candidate's past work to
-the target roles. Keep unknowns explicit.}
+{Candidate-confirmed career narrative. Keep unknowns explicit.}
 
-## Proof points
+## Your Cross-cutting Advantage
 
-- {confirmed outcome, scope, and method}
-- {confirmed outcome, scope, and method}
-- {confirmed outcome, scope, and method}
+{Confirmed strength and its evidence. Do not assume an occupation or seniority.}
 
-## Compensation
+## Your Portfolio / Demo
 
-- Desired range: {candidate-confirmed range and currency, or unknown}
-- Hard floor: {candidate-confirmed value, or unknown}
-- Never infer or auto-fill an unconfirmed figure.
+{Only links the candidate confirms may be shared. Never include credentials.}
 
-## Location and work authorization
+## Your Comp Targets
 
-- Home location: {confirmed location}
-- Work modes: {remote, hybrid, on-site, travel, or unknown}
-- Authorized locations: {confirmed facts only}
-- Sponsorship needs: {confirmed facts only}
+{Confirmed range and currency, or unknown. Never invent a minimum.}
 
-## Negotiation notes
+## Your Negotiation Scripts
 
-{Record only preferences and scripts the candidate approves.}
+{Scripts and preferences approved by the candidate.}
 
-## Portfolio or supporting evidence
+## Your Location Policy
 
-{Links or files the candidate confirms may be shared. Never expose private
-credentials, passwords, or unapproved work samples.}
+{Confirmed location, work modes, work authorization and sponsorship needs.}

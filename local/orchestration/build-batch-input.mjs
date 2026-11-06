@@ -4,11 +4,8 @@
  *
  * Selection is threshold-first, with a cap as a budget guard behind it.
  *
- * The threshold does the cutting because it cuts on quality: measured over the first 226
- * triaged roles, a 3.5 bar passes 25% (~139 of 553), and 31 of those 57 passes bunch in
- * the 3.6-3.9 band right above the bar. A "top 100" cap on that distribution lands at
- * ~3.7 and removes almost nothing — it looks like a control while barely being one.
- * Raising the bar to 4.0 is what actually halves the work.
+ * The score threshold selects qualifying roles; the cap bounds each wave.
+ * Deferred rows keep their saved scores for a later run.
  *
  * The cap still exists, because a good scan day should not be able to turn into an
  * unbounded bill. Nothing capped is discarded: every role keeps its score in
@@ -26,11 +23,13 @@
  *   node local/orchestration/build-batch-input.mjs [--min-score N] [--include-marginal]
  */
 
-import { readFileSync, writeFileSync, existsSync, realpathSync } from 'fs';
+import { getProfilePath } from '../../path-resolver.mjs';
+import { isMainModule } from '../../lib/is-main-module.mjs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import assert from 'assert';
-import yaml from 'js-yaml';
+import { loadYaml } from '../../lib/yaml-document.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const VERDICTS = path.join(ROOT, 'data/triage-verdicts.tsv');
@@ -89,8 +88,13 @@ export function selectSurvivors(tsv, { minScore, includeMarginal }) {
 }
 
 function main(argv) {
+  if (argv.length === 1 && ['--help', '-h'].includes(argv[0])) {
+    console.log('Usage: node local/orchestration/build-batch-input.mjs [options]');
+    return;
+  }
+
   const arg = (f, d) => { const i = argv.indexOf(f); return i === -1 ? d : argv[i + 1]; };
-  const cfg = yaml.load(readFileSync(path.join(ROOT, 'config/profile.yml'), 'utf-8')) || {};
+  const cfg = loadYaml(readFileSync(getProfilePath(), 'utf-8')) || {};
   const minScore = Number(arg('--min-score', cfg?.pipeline?.eval_min_score ?? 4.0));
   const max = Number(arg('--max', cfg?.pipeline?.eval_max ?? 100));
   const includeMarginal = argv.includes('--include-marginal');
@@ -184,10 +188,8 @@ function demo() {
   console.log('build-batch-input self-check: all assertions passed');
 }
 
-// Compare REAL paths: node resolves symlinks for import.meta.url but not for
-// process.argv[1], so under the symlinked worker root the naive form never matches
-// and the script silently exits 0 without running. That made triage a no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The shared guard handles imports, direct execution and symlinked worker roots.
+if (isMainModule(import.meta.url)) {
   if (process.argv.includes('--demo')) demo();
   else main(process.argv.slice(2));
 }

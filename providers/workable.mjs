@@ -24,8 +24,18 @@
 //
 // Auto-detects from careers_url pattern `https://apply.workable.com/<slug>`. A
 // tracked_companies entry can also set `provider: workable` to bypass detection.
+//
+// Requests to both the widget API and the markdown fallback carry browser-like
+// headers and go through retry-with-backoff, and are serialized process-wide
+// against apply.workable.com — Cloudflare fronts every tenant on that single
+// host and can rate-limit or (for a specific account) block the widget API
+// path for hours at a time while the markdown feed on that same account keeps
+// returning 200. An hours-long `Retry-After` is not worth honouring; giving up
+// fast and falling through to the markdown feed serves the scan better than
+// stalling on it.
 
 import { decodeEntities } from './_html-entities.mjs';
+import { BROWSER_LIKE_USER_AGENT, isRetryableError, parseRetryAfterMs, sleep } from './_http.mjs';
 
 const ALLOWED_WORKABLE_HOSTS = new Set(['apply.workable.com']);
 
@@ -33,6 +43,63 @@ const ALLOWED_WORKABLE_HOSTS = new Set(['apply.workable.com']);
 // rejected rather than interpolated, so a crafted careers_url cannot escape the
 // path (e.g. `..%2f..%2f`) when we build the API URL.
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+
+const WORKABLE_HEADERS = {
+  'user-agent': BROWSER_LIKE_USER_AGENT,
+  'accept-language': 'en-US,en;q=0.9',
+  origin: 'https://apply.workable.com',
+};
+
+// Retry policy for a single request (429 with a short Retry-After, 5xx,
+// timeouts/aborts — classified by _http.mjs's isRetryableError/parseRetryAfterMs,
+// shared with workday.mjs / oraclecloud.mjs). The loop itself stays local
+// rather than routing through _http.mjs's fetchJsonWithRetry: this provider
+// needs to give up before exhausting its retries when the server declares a
+// long Retry-After (see GIVE_UP_RETRY_AFTER_MS below), which the shared
+// helper's clamp-and-keep-retrying policy doesn't support, and it retries
+// both a JSON call (widget API) and a text call (markdown feed), where the
+// shared helper only wraps fetchJson.
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 8_000;
+
+// A server-declared Retry-After beyond this isn't worth waiting out — give up
+// on the widget API immediately and fall through to the markdown feed instead
+// of stalling the scan for it.
+const GIVE_UP_RETRY_AFTER_MS = 30_000;
+
+/**
+ * Runs `fn`, retrying transient failures with backoff + jitter. Gives up
+ * immediately (no more retries) on a Retry-After longer than
+ * GIVE_UP_RETRY_AFTER_MS, or on a non-retryable error.
+ */
+async function fetchWithRetry(ctx, fn) {
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === MAX_RETRIES || !isRetryableError(err)) throw err;
+      const retryAfterMs = parseRetryAfterMs(err?.retryAfter);
+      if (retryAfterMs !== null && retryAfterMs > GIVE_UP_RETRY_AFTER_MS) throw err;
+      const backoff = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
+      const delayMs = retryAfterMs !== null ? retryAfterMs : (backoff + Math.random() * 250);
+      await sleep(delayMs, ctx);
+    }
+  }
+  throw lastErr;
+}
+
+// Process-wide serialization: apply.workable.com fronts every tenant on the
+// same host, so this process never needs more than one in-flight request to
+// it at a time.
+let workableQueue = Promise.resolve();
+function serialized(fn) {
+  const result = workableQueue.then(fn, fn);
+  workableQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
 
 function assertWorkableUrl(url) {
   let parsed;
@@ -84,23 +151,36 @@ export default {
     const slug = resolveWorkableSlug(entry);
     if (!slug) throw new Error(`workable: cannot derive feed URL for ${entry.name}`);
 
-    // Primary: widget API. assertWorkableUrl + redirect:'error' together
-    // guarantee the final hostname stays in the allowlist (no SSRF via redirect).
-    const apiUrl = assertWorkableUrl(widgetUrlFor(slug));
-    let payload = null;
-    try {
-      payload = await ctx.fetchJson(apiUrl, { redirect: 'error' });
-    } catch {
-      payload = null; // fall through to the markdown feed
-    }
-    if (payload && Array.isArray(payload.jobs)) {
-      return parseWorkableWidget(payload, entry.name);
-    }
+    const referer = `https://apply.workable.com/${slug}/`;
 
-    // Fallback: legacy markdown feed (small accounts only — see header note).
-    const feedUrl = assertWorkableUrl(feedUrlFor(slug));
-    const text = await ctx.fetchText(feedUrl, { redirect: 'error' });
-    return parseWorkableMarkdown(text, entry.name);
+    return serialized(async () => {
+      // Primary: widget API. assertWorkableUrl + redirect:'error' together
+      // guarantee the final hostname stays in the allowlist (no SSRF via
+      // redirect). Retries transient failures; gives up early on a
+      // long-lived Retry-After so a Cloudflare-level block on this path
+      // falls through to the markdown feed instead of stalling the scan.
+      const apiUrl = assertWorkableUrl(widgetUrlFor(slug));
+      let payload = null;
+      try {
+        payload = await fetchWithRetry(ctx, () => ctx.fetchJson(apiUrl, {
+          redirect: 'error',
+          headers: { ...WORKABLE_HEADERS, referer },
+        }));
+      } catch {
+        payload = null; // fall through to the markdown feed
+      }
+      if (payload && Array.isArray(payload.jobs)) {
+        return parseWorkableWidget(payload, entry.name);
+      }
+
+      // Fallback: legacy markdown feed (small accounts only — see header note).
+      const feedUrl = assertWorkableUrl(feedUrlFor(slug));
+      const text = await fetchWithRetry(ctx, () => ctx.fetchText(feedUrl, {
+        redirect: 'error',
+        headers: { ...WORKABLE_HEADERS, referer },
+      }));
+      return parseWorkableMarkdown(text, entry.name);
+    });
   },
 };
 
@@ -120,9 +200,16 @@ function safeJobUrl(raw) {
   }
 }
 
+// Joins the locations of a multi-country posting into one cell. This is the
+// shape location_filter already expects — see buildLocationFilter in scan.mjs,
+// whose always_allow tier exists precisely so "Stockholm · London · Madrid"
+// survives one blocked city — and the shape the Ashby provider already emits.
+const LOCATION_SEPARATOR = ' · ';
+
 /**
- * Build the location string. The markdown feed rendered "<city>, <country>"; we
- * match that shape so location_filter behaves identically across both paths.
+ * Build the location string for ONE widget entry. The markdown feed rendered
+ * "<city>, <country>"; we match that shape so location_filter behaves
+ * identically across both paths.
  */
 function formatLocation(job) {
   const parts = [job?.city, job?.country].filter(v => typeof v === 'string' && v.trim());
@@ -146,6 +233,29 @@ function toPlainText(html) {
 /**
  * Parse the widget API payload. Exported for unit tests.
  *
+ * A multi-country posting is FANNED OUT by this endpoint into one entry per
+ * location, every one carrying the same shortlink, title, description and
+ * published_on and differing only in city/state/country. Verified live
+ * 2026-10-06 against DigitalGenius: "Implementation Engineer" (801183DB79)
+ * comes back as four entries — London/United Kingdom, Romania, Poland,
+ * Croatia — and "Solutions Engineer" (7C59A413E4) as three more.
+ *
+ * The siblings are therefore folded together here: the first entry supplies
+ * every field, the rest contribute only their location, and the accumulated
+ * set is joined with LOCATION_SEPARATOR. Discarding them (first-wins on URL,
+ * which is what this did before) recorded that role as "London, United
+ * Kingdom" alone, so a UK block rule rejected a posting that had three viable
+ * EU alternatives.
+ *
+ * Two dead ends, both measured rather than assumed:
+ *   · each entry's own `locations[]` array holds ONLY that entry's single
+ *     location, so it is not a shortcut to the full set;
+ *   · the per-job detail endpoint (/api/v1/accounts/<slug>/jobs/<shortcode>)
+ *     does carry a complete array, but costs one extra request per posting.
+ * The markdown fallback in parseWorkableMarkdown cannot be fixed the same way:
+ * it does not fan out, it just prints the primary location and drops the rest
+ * at the source, so nothing is left in its rows to accumulate.
+ *
  * @param {any} payload — parsed JSON body of the widget endpoint
  * @param {string} companyName — value to write into job.company
  * @returns {Array<{title: string, url: string, company: string, location: string, description?: string, postedAt?: number}>}
@@ -153,7 +263,8 @@ function toPlainText(html) {
 export function parseWorkableWidget(payload, companyName) {
   if (!payload || !Array.isArray(payload.jobs)) return [];
   const jobs = [];
-  const seen = new Set();
+  /** @type {Map<string, {job: any, locations: Set<string>}>} */
+  const byUrl = new Map();
   for (const raw of payload.jobs) {
     const title = typeof raw?.title === 'string' ? raw.title.trim() : '';
     if (!title) continue;
@@ -161,11 +272,21 @@ export function parseWorkableWidget(payload, companyName) {
     // shortlink is the canonical public permalink; url is the same host. Either
     // is fine, both are validated. Off-domain or non-https entries are dropped.
     const url = safeJobUrl(raw?.shortlink) || safeJobUrl(raw?.url);
-    if (!url || seen.has(url)) continue;
-    seen.add(url);
+    if (!url) continue;
+
+    const location = formatLocation(raw);
+
+    const merged = byUrl.get(url);
+    if (merged) {
+      // Fanned-out sibling of a posting already emitted: it contributes its
+      // location and nothing else. Empty locations add nothing; a repeated one
+      // collapses, so the cell never says "Romania · Romania".
+      if (location) merged.locations.add(location);
+      continue;
+    }
 
     /** @type {any} */
-    const job = { title, url, location: formatLocation(raw), company: companyName };
+    const job = { title, url, location, company: companyName };
 
     const description = toPlainText(raw?.description);
     if (description) job.description = description;
@@ -174,6 +295,13 @@ export function parseWorkableWidget(payload, companyName) {
     if (Number.isFinite(stamp)) job.postedAt = stamp;
 
     jobs.push(job);
+    byUrl.set(url, { job, locations: new Set(location ? [location] : []) });
+  }
+
+  // A Set iterates in insertion order, so the joined cell follows payload order
+  // and a single-location posting re-joins to the exact string it already had.
+  for (const { job, locations } of byUrl.values()) {
+    job.location = [...locations].join(LOCATION_SEPARATOR);
   }
   return jobs;
 }

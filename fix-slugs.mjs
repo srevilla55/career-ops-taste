@@ -4,13 +4,17 @@
  * fix-slugs.mjs — write verify-portals.mjs's suggested ATS slug fixes back
  * into portals.yml.
  *
- * verify-portals.mjs already probes every tracked company's ATS slug and, for
- * a failing Greenhouse/Ashby/Lever entry, cross-probes slug variants across
- * all three ATSes and attaches `suggested: { ats, slug }` when one resolves
- * (see discoverAlternates() in verify-portals.mjs). That tool is read-only —
- * this script is the write side: it reuses the SAME probe/suggestion logic
- * (no re-implementation, no HTML scraping, no hardcoded company list) and
- * patches the matching `tracked_companies` entry in portals.yml.
+ * verify-portals.mjs already probes every tracked company's ATS slug. Its
+ * "tier 1" fast path is hardcoded to the three ATSes whose board URL carries a
+ * parseable slug — Greenhouse, Ashby, Lever — and for a failing entry it
+ * cross-probes slug variants across those three, attaching
+ * `suggested: { ats, slug }` when one resolves (see discoverAlternates() in
+ * verify-portals.mjs). Any other host is a provider-plugin (tier 2) entry and
+ * never gets a `suggested`, so this script only ever rewrites Greenhouse / Ashby
+ * / Lever slugs. That tool is read-only — this is the write side: it reuses the
+ * SAME probe/suggestion logic (no re-implementation, no HTML scraping, no
+ * hardcoded company list) and patches the matching `tracked_companies` entry in
+ * portals.yml.
  *
  * Only entries verify-portals classifies as `missing` AND carries a
  * `suggested` alternate for are touched. Live/empty entries and genuinely
@@ -27,18 +31,60 @@
  *   node fix-slugs.mjs --fix         # write the resolved slugs back to portals.yml
  *   node fix-slugs.mjs --apply       # alias for --fix
  *   node fix-slugs.mjs --file <path> # use a specific portals file
+ *   node fix-slugs.mjs --help        # show this message (-h is an alias)
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
-import { pathToFileURL } from 'url';
+import { existsSync, readFileSync } from 'fs';
+import { join, resolve } from 'path';
 
 import { verifyPortalsFile } from './verify-portals.mjs';
+import { replaceUserFile } from './tracker-utils.mjs';
+import { flagValue, hasFlag, validateFlags } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
+// The data root's portals.yml, the same default verify-portals.mjs sweeps
+// (#4254). A bare 'portals.yml' resolved against the cwd, so under an external
+// data root (CAREER_OPS_ROOT / CAREER_OPS_DATA_DIR / .career-ops-data) this
+// reported "nothing to fix" for the file verify-portals had just flagged, or
+// with --fix rewrote a stale copy in whatever directory it was run from.
+const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || join(getCareerOpsRoot(), 'portals.yml');
+
+const KNOWN_FLAGS = ['--apply', '--dry-run', '--file', '--fix', '--help', '-h'];
+const VALUE_FLAGS = ['--file'];
+
+const USAGE = `Usage:
+  node fix-slugs.mjs               # dry run (default, safe) — prints the diff, writes nothing
+  node fix-slugs.mjs --dry-run     # same as above, explicit
+  node fix-slugs.mjs --fix         # write the resolved slugs back to portals.yml
+  node fix-slugs.mjs --apply       # alias for --fix
+  node fix-slugs.mjs --file <path> # use a specific portals file
+  node fix-slugs.mjs --help        # show this message (-h is an alias)`;
 
 /** Matches a `tracked_companies` list-item start line: `  - name: Foo`. */
 const NAME_LINE_RE = /^([ \t]*)-\s*name:\s*(.+?)\s*$/;
+
+/**
+ * The value of a `name:` scalar as the YAML parser reads it. verify-portals
+ * reports a company under its parsed name, so a block keyed by the raw text
+ * (`"Foo Bar"`, `Foo Bar   # London`) never matched its result and the fix was
+ * dropped without a word.
+ *
+ * @param {string} raw - Everything after `name:` on the line.
+ * @returns {string}
+ */
+function nameScalar(raw) {
+  const text = raw.trim();
+  let m = text.match(/^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/);
+  if (m) {
+    try { return JSON.parse(`"${m[1]}"`); } catch { return m[1]; }
+  }
+  m = text.match(/^'((?:[^']|'')*)'\s*(?:#.*)?$/);
+  if (m) return m[1].replace(/''/g, "'");
+  // Plain scalar: a comment starts at whitespace followed by #.
+  const hash = text.search(/\s#/);
+  return (hash === -1 ? text : text.slice(0, hash)).trim();
+}
 
 /**
  * Split a portals.yml's raw text into per-company blocks, keyed by the exact
@@ -61,7 +107,7 @@ export function splitCompanyBlocks(text) {
         current.endLine = i;
         blocks.push(current);
       }
-      current = { name: m[2].trim(), indent: m[1], startLine: i, endLine: null };
+      current = { name: nameScalar(m[2]), indent: m[1], startLine: i, endLine: null };
     }
   }
   if (current) {
@@ -279,7 +325,13 @@ export function computeFixes(rawText, results, { dateStr = new Date().toISOStrin
   // invalidated by a fix applied further down.
   const pending = [];
   for (const r of results) {
+    // `suggested` must carry a writable ats/slug. A result can now also carry
+    // `suggested.rejectedAlternate` — a live board the identity gate refused — and
+    // that is reporting only. Without this guard a rejected-only result would pass
+    // the truthiness check below and applyFix would write `undefined/undefined`
+    // into portals.yml (#4230).
     if (r.status !== 'missing' || !r.suggested) continue;
+    if (!r.suggested.ats || !r.suggested.slug) continue;
     const block = blocksByName.get(r.name);
     if (!block) continue; // name mismatch — leave untouched rather than guess
     pending.push({ r, block });
@@ -320,11 +372,22 @@ function printDiff(fixes, { dryRun }) {
 
 async function main() {
   const args = process.argv.slice(2);
+
+  if (hasFlag(args, '--file')) {
+    const rawVal = flagValue(args, '--file');
+    if (rawVal === undefined || rawVal === '' || rawVal.startsWith('-')) {
+      console.error('Error: --file requires a value');
+      process.exit(1);
+    }
+  }
+
+  validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS });
+
   const fix = args.includes('--fix') || args.includes('--apply');
   const dryRun = !fix; // default is always safe — writing requires an explicit flag
 
-  const fileFlag = args.indexOf('--file');
-  const filePath = resolve(fileFlag === -1 ? DEFAULT_PORTALS_PATH : args[fileFlag + 1] || '');
+  const fileVal = flagValue(args, '--file');
+  const filePath = resolve(fileVal || DEFAULT_PORTALS_PATH);
 
   if (!existsSync(filePath)) {
     console.log(`fix-slugs: no portals file at ${filePath} — nothing to fix.`);
@@ -338,7 +401,7 @@ async function main() {
   printDiff(fixes, { dryRun });
 
   if (!dryRun && fixes.length > 0) {
-    writeFileSync(filePath, text, 'utf-8');
+    replaceUserFile(filePath, text);
     console.log(`\nportals.yml updated (${fixes.length} fixed).`);
   } else if (dryRun && fixes.length > 0) {
     console.log('\nRun with --fix to write these changes to portals.yml.');
@@ -346,7 +409,7 @@ async function main() {
 }
 
 // Only run main() when invoked directly, not when imported by tests.
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(`fix-slugs failed: ${err.message}`);
     process.exit(1);

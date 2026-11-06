@@ -1,8 +1,8 @@
 {
   "name": "career-ops",
   "metadata": {
-    "description": "AI job search command center — evaluate offers, tailor CVs, scan portals, track applications",
-    "version": "1.0.0"
+    "description": "Privacy-clean Career-Ops starter with dashboard and resumable discovery workflows",
+    "version": "1.39.0"
   },
   "owner": {
     "name": "santifer",
@@ -12,9 +12,9 @@
     {
       "name": "career-ops",
       "source": "./",
-      "description": "AI job search pipeline — evaluate offers, tailor CVs, scan portals, track applications",
+      "description": "Privacy-clean Career-Ops starter with dashboard and resumable discovery workflows",
       "category": "productivity",
-      "version": "1.0.0"
+      "version": "1.39.0"
     }
   ]
 }

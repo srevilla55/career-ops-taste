@@ -21,7 +21,7 @@ export const PAGE_FORMATS = new Set(["a4", "letter"]);
  * table says `page_format` "Defaults to `letter`". Picking a4 here would make the
  * web disagree with the CLI about the same missing field — and would silently
  * change the page size of an existing render path, which #2185 never asked for.
- * The prompt still tells the agent to CHOOSE a4 unless the company is US/Canada;
+ * The parser accepts legacy letter declarations; new employer-facing runs require A4;
  * this only applies when it declares nothing at all.
  */
 export const DEFAULT_PAGE_FORMAT = "letter";

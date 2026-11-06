@@ -15,6 +15,7 @@ func TestDeriveNoteFields(t *testing.T) {
 		payRange string
 		paySrc   string
 		last     string
+		postedOn string
 	}{
 		{
 			name: "remote with posted comma range and rejection date",
@@ -26,6 +27,39 @@ func TestDeriveNoteFields(t *testing.T) {
 			payRange: "$174,986-209,983",
 			paySrc:   "POSTED",
 			last:     "2026-06-05",
+		},
+		{
+			name: "labelled location outside the city list",
+			app: model.CareerApplication{
+				Notes: "Location: Cardiff, UK; via company site",
+			},
+			location: "Cardiff, UK",
+			workMode: "Full",
+		},
+		{
+			name: "labelled three-part location is kept whole",
+			app: model.CareerApplication{
+				Notes: "Location: Hook, Hampshire, UK",
+			},
+			location: "Hook, Hampshire, UK",
+			workMode: "Full",
+		},
+		{
+			name: "labelled location beats a listed city mentioned elsewhere",
+			app: model.CareerApplication{
+				Notes: "Team also in London; Location: Watford, Hertfordshire, United Kingdom",
+			},
+			location: "Watford, Hertfordshire, United Kingdom",
+			workMode: "Full",
+		},
+		{
+			name: "tracker Location column beats notes",
+			app: model.CareerApplication{
+				Location: "Cardiff, UK",
+				Notes:    "Location: London, UK",
+			},
+			location: "Cardiff, UK",
+			workMode: "Full",
 		},
 		{
 			name: "hybrid city state with estimate",
@@ -257,6 +291,143 @@ func TestDeriveNoteFields(t *testing.T) {
 			payRange: "",
 			last:     "2026-04-11",
 		},
+		{
+			name: "posted date populates PostedOn without becoming last contact",
+			app: model.CareerApplication{
+				Date:  "2026-08-06",
+				Notes: "Santa Clara, CA; posted 2026-08-07",
+			},
+			location: "Santa Clara, CA",
+			workMode: "Full",
+			last:     "2026-08-06",
+			postedOn: "2026-08-07",
+		},
+		{
+			name: "a real interaction still wins last contact over the posting date",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Austin, TX; Posted: 2026-05-20. Recruiter screen 2026-06-14",
+			},
+			location: "Austin, TX",
+			workMode: "Full",
+			last:     "2026-06-14",
+			postedOn: "2026-05-20",
+		},
+		{
+			name: "the POSTED pay marker carries no date and sets no PostedOn",
+			app: model.CareerApplication{
+				Date:  "2026-06-04",
+				Notes: "Remote US. Base $174,986-209,983 (POSTED)",
+			},
+			workMode: "Remote",
+			payRange: "$174,986-209,983",
+			paySrc:   "POSTED",
+			last:     "2026-06-04",
+		},
+		{
+			// The regression the segment anchor exists to prevent. With a
+			// word-boundary match this date was read as posting metadata AND
+			// stripped from the last-contact scan, so a recruiter interaction
+			// that really happened vanished and the row fell back to its applied
+			// date. Prose is not a segment: "posted" mid-sentence stays contact.
+			name: "prose \"posted\" is a real interaction, not posting metadata",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Recruiter posted 2026-07-20 update on the req",
+			},
+			last: "2026-07-20",
+		},
+		{
+			name: "a posting segment is still read when the note leads with it",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "posted 2026-05-11 | Remote US",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+			postedOn: "2026-05-11",
+		},
+		{
+			// Edge 1 of the two the review asked to pin: the colon form with no
+			// space. It is unambiguously a segment, so it must populate PostedOn
+			// — and, having done so, must not also count as contact.
+			name: "posted:<date> with no space is a posting segment",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Remote US; posted:2026-07-15",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+			postedOn: "2026-07-15",
+		},
+		{
+			// The bare form requires a space, so this sets no PostedOn. It is
+			// not contact either — reISODate needs a word boundary the welded
+			// "posted2026" does not give it — so the row keeps its applied date
+			// and the malformed token is inert on both paths.
+			name: "\"posted\" welded to the date is inert, not a segment",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Remote US; posted2026-07-15",
+			},
+			workMode: "Remote",
+			last:     "2026-06-01",
+		},
+		{
+			// Edge 2: two posting dates in one note. A re-post replaces the req,
+			// so the column has to show the live one — the first match would pin
+			// the row to a requisition that no longer exists.
+			name: "with two posting dates the most recent one wins",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "posted: 2026-03-02 | reposted; posted: 2026-07-19",
+			},
+			last:     "2026-06-01",
+			postedOn: "2026-07-19",
+		},
+		{
+			name: "stripping a posting segment cannot weld its neighbours together",
+			app: model.CareerApplication{
+				Date:  "2026-06-01",
+				Notes: "Austin, TX; posted: 2026-05-20; screen 2026-06-14",
+			},
+			location: "Austin, TX",
+			workMode: "Full",
+			last:     "2026-06-14",
+			postedOn: "2026-05-20",
+		},
+		{
+			// #4600: "L4 EUR" used to be misread as pay "4 EUR".
+			name: "level code digit before currency does not steal the real range",
+			app: model.CareerApplication{
+				Date:  "2026-01-10",
+				Notes: "Remote EU; levels.fyi L4 EUR 100-150K Amsterdam",
+			},
+			location: "Amsterdam",
+			workMode: "Remote",
+			payRange: "EUR 100-150K",
+			last:     "2026-01-10",
+		},
+		{
+			// The level-code guard must not reject a currency symbol glued
+			// to a letter: the currency token anchors the span.
+			name: "currency symbol right after a letter still reads as pay",
+			app: model.CareerApplication{
+				Date:  "2026-01-10",
+				Notes: "US$120K",
+			},
+			payRange: "$120K",
+			last:     "2026-01-10",
+		},
+		{
+			name: "currency symbol right after CJK text still reads as pay",
+			app: model.CareerApplication{
+				Date:  "2026-01-10",
+				Notes: "年収¥8M",
+			},
+			payRange: "¥8M",
+			last:     "2026-01-10",
+		},
 	}
 
 	for _, tc := range cases {
@@ -279,6 +450,9 @@ func TestDeriveNoteFields(t *testing.T) {
 			}
 			if tc.app.LastContact != tc.last {
 				t.Errorf("LastContact = %q, want %q", tc.app.LastContact, tc.last)
+			}
+			if tc.app.PostedOn != tc.postedOn {
+				t.Errorf("PostedOn = %q, want %q", tc.app.PostedOn, tc.postedOn)
 			}
 		})
 	}
@@ -320,27 +494,27 @@ func TestBuildMoneySpanRegex(t *testing.T) {
 		{
 			name:    "single bare symbol ($)",
 			input:   []string{"$"},
-			wantPat: `~?(?:(?:\$)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:\$)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?|\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:\$))`,
+			wantPat: `(~?(?:\$)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:\$)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:\$))`,
 		},
 		{
 			name:    "single ISO code (PLN)",
 			input:   []string{"PLN"},
-			wantPat: `~?(?:(?:PLN ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:PLN ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?|\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:PLN))`,
+			wantPat: `(~?(?:PLN ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:PLN ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:PLN))`,
 		},
 		{
 			name:    "two ISO codes (PLN, UAH)",
 			input:   []string{"PLN", "UAH"},
-			wantPat: `~?(?:(?:PLN ?|UAH ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:PLN ?|UAH ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?|\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:PLN|UAH))`,
+			wantPat: `(~?(?:PLN ?|UAH ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:PLN ?|UAH ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:PLN|UAH))`,
 		},
 		{
 			name:    "mixed bare + ISO ($ bare, PLN ISO)",
 			input:   []string{"$", "PLN"},
-			wantPat: `~?(?:(?:\$|PLN ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:\$|PLN ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?|\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:\$|PLN))`,
+			wantPat: `(~?(?:\$|PLN ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:\$|PLN ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:\$|PLN))`,
 		},
 		{
 			name:    "metachar token (escaped via QuoteMeta)",
 			input:   []string{"A.B"},
-			wantPat: `~?(?:(?:A\.B ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:A\.B ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?|\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:A\.B))`,
+			wantPat: `(~?(?:A\.B ?)\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*(?:A\.B ?)?\d[\d,]*(?:\.\d+)?[KkMmBb]?)?)|(?:^|[^\p{L}\p{N}])(~?\d[\d,]*(?:\.\d+)?[KkMmBb]?(?:\s*[-–]\s*\d[\d,]*(?:\.\d+)?[KkMmBb]?)?\s+(?:A\.B))`,
 		},
 	}
 	for _, tc := range cases {
@@ -374,9 +548,14 @@ func TestBuildMoneySpanRegex_SuffixNoTrailingSpace(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := re.FindString(tc.input)
-			if got == "" {
+			// Group 2: amount-first span; group 0 also has the boundary char.
+			m := re.FindStringSubmatch(tc.input)
+			if m == nil || m[2] == "" {
 				t.Fatalf("no match for %q", tc.input)
+			}
+			got := m[2]
+			if got[0] == ' ' {
+				t.Errorf("matched span %q has leading space", got)
 			}
 			if got[len(got)-1] == ' ' {
 				t.Errorf("matched span %q has trailing space", got)

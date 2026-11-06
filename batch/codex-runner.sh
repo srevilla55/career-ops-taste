@@ -11,7 +11,7 @@ set -euo pipefail
 # runners never block each other on "another runner is already running"
 # or on one CLI's rate limit pausing the other's queue.
 #
-# Model tiers: GPT-5.6 Luna (economy) / Terra (standard) / Sol (premium).
+# All spend tiers use GPT-6.1 Sol at high reasoning for evaluation.
 # Keep spend_tier_to_model() below in sync with the Codex row in
 # modes/_shared.md.
 #
@@ -184,7 +184,13 @@ release_lock() {
 # Assemble the static prompt once per run (candidate context + shared
 # instructions). Job-specific values travel in the per-offer prompt instead.
 build_run_prompt() {
-  cp "$PROMPT_FILE" "$RUN_PROMPT"
+  sed \
+    -e "s|{{URL}}|<URL from the job message>|g" \
+    -e "s|{{JD_FILE}}|<JD file from the job message>|g" \
+    -e "s|{{REPORT_NUM}}|<report number from the job message>|g" \
+    -e "s|{{DATE}}|<date from the job message>|g" \
+    -e "s|{{ID}}|<batch ID from the job message>|g" \
+    "$PROMPT_FILE" > "$RUN_PROMPT"
   local context_file
   for context_file in "$PROJECT_DIR/cv.md" "$PROJECT_DIR/article-digest.md" "$PROJECT_DIR/modes/_profile.md" "$PROJECT_DIR/config/profile.yml" "$PROJECT_DIR/modes/_custom.md"; do
     if [[ -f "$context_file" ]]; then
@@ -398,11 +404,7 @@ read_spend_tier() {
 
 # Tier -> model mapping. Keep in sync with the Codex row in modes/_shared.md.
 spend_tier_to_model() {
-  case "$1" in
-    economy) echo "gpt-5.6-luna" ;;
-    premium) echo "gpt-5.6-sol" ;;
-    standard|*) echo "gpt-5.6-terra" ;;
-  esac
+  echo "gpt-6.1-sol"
 }
 
 # Resolve the model to pass to `codex exec --model`. --model always wins.
@@ -480,6 +482,23 @@ is_rate_limit_log() {
 is_session_limit_log() {
   local log_file="$1"
   grep -Eiq '(session limit|resets [0-9:]+[ap]m|usage limit|limit[[:space:]]+reached)' "$log_file"
+}
+
+is_access_egress_log() {
+  node - "$1" <<'NODE'
+const fs = require('fs');
+const rejected = /(model.*(not supported|does not exist|not found|access.*denied|do not have access)|egress[ _-]*(guard|blocked|denied)|sensitive[ _-]*data[ _-]*egress)/i;
+const found = fs.readFileSync(process.argv[2], 'utf8').split('\n').some(line => {
+  try {
+    const event = JSON.parse(line);
+    // Only provider errors: report prose and logged commands are not rejections.
+    return ['error', 'turn.failed'].includes(event.type) && rejected.test(event.message || event.error?.message || '');
+  } catch {
+    return rejected.test(line);
+  }
+});
+process.exit(found ? 0 : 1);
+NODE
 }
 
 mark_paused_rate_limit() {
@@ -567,7 +586,7 @@ process_offer() {
 
   local prompt
   if [[ "$SKIP_PDF" == "true" ]]; then
-    prompt="Process this job offer. Run the pipeline: A-G evaluation + report .md + tracker line. Do not generate PDF; write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
+    prompt="Process this job offer. Run only A-G evaluation + report .md + tracker line. Do not generate PDFs, Block H application answers, output packages, CVs, cover letters, outreach, or submissions; write ❌ in the tracker PDF column and set \"pdf\": null in the final JSON."
     echo "    ⏭️  --skip-pdf set — skipping PDF generation for #$id ($url)"
   else
     prompt="Process this job offer. Run the full pipeline: A-G evaluation + report .md + optional PDF + tracker line."
@@ -603,6 +622,13 @@ $prompt"
     codex "${codex_args[@]}" >> "$log_file" 2>&1 <<< "$full_prompt" || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
+      break
+    fi
+
+    if is_access_egress_log "$log_file"; then
+      printf '%s\t%s\taccess or egress rejected\n' "$id" "$report_num" > "$PAUSE_FILE"
+      BATCH_PAUSED=true
+      echo "    ⏸️  Model access or egress rejected; stopping batch."
       break
     fi
 
@@ -675,6 +701,10 @@ $prompt"
 
     if [[ -n "$worker_failed_match" ]]; then
       [[ -z "$worker_error_match" ]] && worker_error_match="worker reported status:failed (exit code 0)"
+      if grep -Eiq '(model.*(not supported|does not exist|not found|access.*denied|do not have access)|egress[ _-]*(guard|blocked|denied)|sensitive[ _-]*data[ _-]*egress)' <<< "$worker_error_match"; then
+        printf '%s\t%s\taccess or egress rejected\n' "$id" "$report_num" > "$PAUSE_FILE"
+        BATCH_PAUSED=true
+      fi
       if (( retries < MAX_RETRIES )); then
         retries=$((retries + 1))
       fi
@@ -692,6 +722,16 @@ $prompt"
       update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "worker exited cleanly but wrote no report file for this report number" "$retries"
       release_report_num "$report_num"
       echo "    ❌ Failed (no report file on disk, attempt $retries)"
+      return 0
+    fi
+
+    # Completion is proven by the artifacts consumed by the next stage.
+    local artifact_error
+    if ! artifact_error=$(node "$PROJECT_DIR/validate-batch-artifacts.mjs" "$PROJECT_DIR" "$report_num" "$id" "$url" "$score" "$jd_file" 2>&1); then
+      if (( retries < MAX_RETRIES )); then retries=$((retries + 1)); fi
+      update_state "$id" "$url" "failed" "$started_at" "$completed_at" "$report_num" "-" "$artifact_error" "$retries"
+      release_report_num "$report_num"
+      echo "    ❌ Failed (incomplete artifacts, attempt $retries): $artifact_error"
       return 0
     fi
 

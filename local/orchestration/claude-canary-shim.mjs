@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { isMainModule } from '../../lib/is-main-module.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -29,7 +30,7 @@ export function forbiddenSources(value, forbidden = DEFAULT_FORBIDDEN) {
 }
 
 // Fields that CARRY content rather than address it. A report's prose legitimately
-// names cv.md and article-digest.md ("Evidence: cv.md, confirmed employer"), and scanning it
+// names cv.md and article-digest.md ("Evidence: cv.md, Acme"), and scanning it
 // flagged a clean Write as a forbidden access in the pre-injection baseline.
 // Writing about a file is not reading it.
 const CONTENT_KEYS = new Set(['content', 'new_string', 'old_string', 'replace_all']);
@@ -243,25 +244,33 @@ function demo() {
     ['--output-format', 'stream-json', '--verbose', '-p', 'prompt', '--model', 'opus'],
     'stream flags are replaced once and all other arguments keep their order',
   );
-  const normalArgs = cliArgs(['-p', 'prompt', '--dangerously-skip-permissions', '--model', 'opus']);
+  const normalArgs = cliArgs(['-p', 'prompt', '--no-session-persistence', '--model', 'opus']);
   assert.deepEqual(normalArgs,
-    ['--output-format', 'stream-json', '--verbose', '-p', 'prompt', '--dangerously-skip-permissions', '--model', 'opus'],
+    ['--output-format', 'stream-json', '--verbose', '-p', 'prompt', '--no-session-persistence', '--model', 'opus'],
     'normal mode leaves runner arguments unchanged');
   const safeArgs = cliArgs([
-    '-p', 'prompt', '--safe-mode', '--dangerously-skip-permissions', '--safe-mode', '--model', 'opus',
+    '-p', 'prompt', '--safe-mode', '--no-session-persistence', '--safe-mode', '--model', 'opus',
   ], true);
   assert.equal(safeArgs.filter(arg => arg === '--safe-mode').length, 1, 'safe mode is inserted exactly once');
   assert.deepEqual(safeArgs,
     ['--output-format', 'stream-json', '--verbose', '--safe-mode', '-p', 'prompt',
-      '--dangerously-skip-permissions', '--model', 'opus'],
-    'safe mode keeps permissions and all other runner arguments in order');
+      '--no-session-persistence', '--model', 'opus'],
+    'safe mode keeps all other runner arguments in order');
   console.log('claude-canary-shim self-check: all assertions passed');
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
-if (isMain) {
-  if (process.argv.includes('--demo')) demo();
-  else run(process.argv.slice(2)).catch(error => {
+if (isMainModule(import.meta.url)) {
+  const args = process.argv.slice(2);
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+    console.log(`Usage: node local/orchestration/claude-canary-shim.mjs [--demo | <claude arguments...>]
+
+  --demo       Run the offline parser and argument self-checks.
+  --help, -h   Show this help without creating metrics or launching Claude.
+
+Worker invocations require CANARY_REAL_CLAUDE and CANARY_METRICS_DIR to be
+absolute paths. Other arguments are forwarded to Claude with stream logging.`);
+  } else if (args.includes('--demo')) demo();
+  else run(args).catch(error => {
     console.error(`claude-canary-shim: ${error.message}`);
     process.exitCode = 1;
   });
